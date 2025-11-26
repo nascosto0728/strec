@@ -1,0 +1,130 @@
+                                                                                                               
+--- Period 8 (Model) -> Period 9 (Test) Evaluation Finished ---                                                      
+  - GAUC     : 0.9041                                                                                                
+  - AUC      : 0.9041                                                                                                
+  -----------------------------------------------------                                                              
+  - Recall@5  : 0.7863   |   NDCG@5  : 0.7242                                                                        
+  - Recall@10 : 0.8309   |   NDCG@10 : 0.7386                                                                        
+  - Recall@20 : 0.8710   |   NDCG@20 : 0.7488                                                                        
+  - Recall@50 : 0.9182   |   NDCG@50 : 0.7582                                                                        
+  -----------------------------------------------------                                                              
+                                                                                                                     
+========================= Period 9 =========================                                                         
+--- [Data] Period 9. Rows: 220690, Pos: 178563                                                                       
+--- Building model: hyper_lora_sasrec ---                                                                            
+[HyperLoRASASRec] Initialized. FFN weights are modulated by Context.                                                 
+/home/zzz/miniforge3/envs/strec/lib/python3.12/site-packages/torch/nn/init.py:566: UserWarning: Initializing zero-ele
+ment tensors is a no-op                                                                                              
+  warnings.warn("Initializing zero-element tensors is a no-op")                                                      
+--- Loading weights from: ./checkpoints/Meta_Refactored_Experiment_lr0.001/period_8/best_model.pth ---               
+Epochs:  10%|███▋                                 | 1/10 [00:56<08:31, 56.88s/it, train_loss=6.4002, val_loss=6.4551]
+--- Training finished for period 9. ---                                                                              
+--- Running Backward Transfer (BWT) Evaluation ---                                                                   
+    - Period 9 GAUC: 0.8705                                                                                          
+--- Average BWT GAUC: 0.8705 ---                                                                                     
+--- Running Forward Transfer (FWT) Evaluation (Period 10) ---                                                        
+                                                                                                                     
+--- Period 9 (Model) -> Period 10 (Test) Evaluation Finished ---                                                     
+  - GAUC     : 0.8997                                                                                                
+  - AUC      : 0.8997                                                                                                
+  -----------------------------------------------------                                                              
+  - Recall@5  : 0.7757   |   NDCG@5  : 0.7077                                                                        
+  - Recall@10 : 0.8235   |   NDCG@10 : 0.7232                                                                        
+  - Recall@20 : 0.8639   |   NDCG@20 : 0.7334                                                                        
+  - Recall@50 : 0.9137   |   NDCG@50 : 0.7434
+  -----------------------------------------------------
+
+  --- Loading weights from: ./checkpoints/Meta_Refactored_Experiment_lr0.001/period_9/best_model.pth ---        [0/596]
+Epochs:  10%|███▋                                 | 1/10 [00:54<08:07, 54.15s/it, train_loss=6.4015, val_loss=6.3053]
+--- Training finished for period 10. ---
+--- Running Backward Transfer (BWT) Evaluation ---
+    - Period 9 GAUC: 0.8755  
+    - Period 10 GAUC: 0.9030 
+--- Average BWT GAUC: 0.8892 ---
+--- Running Forward Transfer (FWT) Evaluation (Period 11) ---
+
+--- Period 10 (Model) -> Period 11 (Test) Evaluation Finished ---
+  - GAUC     : 0.9337
+  - AUC      : 0.9337
+  -----------------------------------------------------
+  - Recall@5  : 0.8409   |   NDCG@5  : 0.7772
+  - Recall@10 : 0.8784   |   NDCG@10 : 0.7894
+  - Recall@20 : 0.9109   |   NDCG@20 : 0.7977
+  - Recall@50 : 0.9457   |   NDCG@50 : 0.8046
+  -----------------------------------------------------
+
+========================= Period 11 =========================
+--- [Data] Period 11. Rows: 220689, Pos: 176739
+--- Building model: hyper_lora_sasrec ---
+[HyperLoRASASRec] Initialized. FFN weights are modulated by Context.
+/home/zzz/miniforge3/envs/strec/lib/python3.12/site-packages/torch/nn/init.py:566: UserWarning: Initializing zero-ele
+ment tensors is a no-op
+  warnings.warn("Initializing zero-element tensors is a no-op")
+--- Loading weights from: ./checkpoints/Meta_Refactored_Experiment_lr0.001/period_10/best_model.pth ---
+Epochs:  10%|███▋                                 | 1/10 [00:54<08:13, 54.84s/it, train_loss=6.2849, val_loss=6.5109]
+--- Training finished for period 11. ---
+--- Running Backward Transfer (BWT) Evaluation ---
+    - Period 9 GAUC: 0.8579  
+    - Period 10 GAUC: 0.8713 
+    - Period 11 GAUC: 0.8992 
+--- Average BWT GAUC: 0.8761 ---
+--- Running Forward Transfer (FWT) Evaluation (Period 12) ---
+
+--- Period 11 (Model) -> Period 12 (Test) Evaluation Finished ---
+  - GAUC     : 0.9430
+  - AUC      : 0.9430
+  -----------------------------------------------------
+  - Recall@5  : 0.8723   |   NDCG@5  : 0.8349
+  - Recall@10 : 0.8981   |   NDCG@10 : 0.8432
+  - Recall@20 : 0.9224   |   NDCG@20 : 0.8494
+  - Recall@50 : 0.9518   |   NDCG@50 : 0.8552
+  -----------------------------------------------------
+
+========================= Period 12 =========================
+--- [Data] Period 12. Rows: 220690, Pos: 179435
+--- Building model: hyper_lora_sasrec ---
+[HyperLoRASASRec] Initialized. FFN weights are modulated by Context.
+/home/zzz/miniforge3/envs/strec/lib/python3.12/site-packages/torch/nn/init.py:566: UserWarning: Initializing zero-element tensors is a no-op
+  warnings.warn("Initializing zero-element tensors is a no-op")
+--- Loading weights from: ./checkpoints/Meta_Refactored_Experiment_lr0.001/period_11/best_model.pth ---
+Epochs:  10%|███▋                                 | 1/10 [00:53<07:58, 53.21s/it, train_loss=6.3751, val_loss=6.5557]
+--- Training finished for period 12. ---
+--- Running Backward Transfer (BWT) Evaluation ---
+    - Period 9 GAUC: 0.8531                                                                                          
+Evaluating:  78%|██████████████████████████████████████████████████████▍               | 7/9 [00:25<00:07,  3.69s/it]    - Period 10 GAUC: 0.8562                                                                                         
+Evaluating:  33%|███████████████████████▎                                              | 3/9 [00:10<00:21,  3.57s/it]    - Period 11 GAUC: 0.8728                                                                                         
+    - Period 12 GAUC: 0.9042                                                                                         
+--- Average BWT GAUC: 0.8716 ---
+--- Running Forward Transfer (FWT) Evaluation (Period 13) ---
+                                                                                                                     
+--- Period 12 (Model) -> Period 13 (Test) Evaluation Finished ---
+  - GAUC     : 0.9333
+  - AUC      : 0.9333
+  -----------------------------------------------------
+  - Recall@5  : 0.8611   |   NDCG@5  : 0.8212
+  - Recall@10 : 0.8880   |   NDCG@10 : 0.8300
+  - Recall@20 : 0.9116   |   NDCG@20 : 0.8360
+  - Recall@50 : 0.9415   |   NDCG@50 : 0.8419
+  -----------------------------------------------------
+
+========================= Period 13 =========================
+--- [Data] Period 13. Rows: 220689, Pos: 170880
+--- Building model: hyper_lora_sasrec ---
+[HyperLoRASASRec] Initialized. FFN weights are modulated by Context.
+/home/zzz/miniforge3/envs/strec/lib/python3.12/site-packages/torch/nn/init.py:566: UserWarning: Initializing zero-element tensors is a no-op
+  warnings.warn("Initializing zero-element tensors is a no-op")
+--- Loading weights from: ./checkpoints/Meta_Refactored_Experiment_lr0.001/period_12/best_model.pth ---
+Epochs:  10%|███▋                                 | 1/10 [00:52<07:53, 52.59s/it, train_loss=6.0851, val_loss=6.0870]
+--- Training finished for period 13. ---
+
+==================== [ Learning Rate 0.001 Summary ] ====================
+
+--- Average Forward Transfer Metrics ---
+  - GAUC     : 0.9227
+  - AUC      : 0.9227
+-------------------------------------------------------
+  - Recall@5  : 0.8273   |   NDCG@5  : 0.7730
+  - Recall@10 : 0.8638   |   NDCG@10 : 0.7849
+  - Recall@20 : 0.8960   |   NDCG@20 : 0.7931
+  - Recall@50 : 0.9342   |   NDCG@50 : 0.8007
+-------------------------------------------------------

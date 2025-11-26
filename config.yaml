@@ -1,0 +1,38 @@
+# Data paths
+data_path: './datasets/record_movielens.parquet'
+meta_path: './datasets/content_movielens.parquet'
+
+# Experiment settings
+dir_name: 'Meta_Refactored_Experiment'
+shuffle: false
+restored_ckpt_mode: 'last'
+
+# Training loop settings
+learning_rates: [0.001]
+num_periods: 14
+train_start_period: 0
+test_start_period: 8
+max_epochs: 10         # 每個 period 最多跑 100 個 epoch
+validation_split: 0.2   # 從「當前 period」切 20% 出來當驗證集
+patience: 1            # 驗證集損失 (val_loss) 連續 10 次沒進步就停止
+
+debug_sample: 0
+
+evaluation:
+  sampling_size: 99
+  Ks: [5, 10, 20, 50]
+
+item_vec_path: './vectors/item_vectors_kge.npy'
+cate_vec_path: './vectors/cate_vectors.npy'
+
+# option: 'hyper_lora_sasrec'  'mlp' 'sasrec'
+model_type: 'hyper_lora_sasrec'  
+# Model Hyperparameters
+model:
+  batch_size: 4096
+  text_embed_dim: 384
+  user_embed_dim: 32
+  item_embed_dim: 32
+  output_dim: 32
+  cate_embed_dim: 16
+  lora_r: 0 # LoRA rank for hyper_lora_sasrec

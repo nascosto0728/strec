@@ -1,0 +1,118 @@
+                   
+--- Period 8 (Model) -> Period 9 (Test) Evaluation Finished ---
+  - GAUC     : 0.8689
+  - AUC      : 0.8689
+  -----------------------------------------------------
+  - Recall@5  : 0.6600   |   NDCG@5  : 0.5740
+  - Recall@10 : 0.7363   |   NDCG@10 : 0.5988
+  - Recall@20 : 0.8112   |   NDCG@20 : 0.6178
+  - Recall@50 : 0.8961   |   NDCG@50 : 0.6347
+  -----------------------------------------------------
+
+========================= Period 9 =========================
+--- [Data] Period 9. Rows: 220690, Pos: 178563
+--- Building model: hyper_lora_sasrec ---
+[HyperLoRASASRec] Initialized. FFN weights are modulated by Context.
+--- Loading weights from: ./checkpoints/Meta_Refactored_Experiment_lr0.001/period_8/best_model.pth ---
+Epochs:  10%|█████▋                                                   | 1/10 [01:37<14:35, 97.27s/it, train_loss=5.0552, val_loss=5.1487]
+--- Training finished for period 9. ---
+--- Running Backward Transfer (BWT) Evaluation ---
+    - Period 9 GAUC: 0.9210                                                                                                              
+--- Average BWT GAUC: 0.9210 ---
+--- Running Forward Transfer (FWT) Evaluation (Period 10) ---
+                                                                                                                                         
+--- Period 9 (Model) -> Period 10 (Test) Evaluation Finished ---
+  - GAUC     : 0.9049
+  - AUC      : 0.9049
+  -----------------------------------------------------
+  - Recall@5  : 0.7497   |   NDCG@5  : 0.6705
+  - Recall@10 : 0.8117   |   NDCG@10 : 0.6907
+  - Recall@20 : 0.8664   |   NDCG@20 : 0.7045
+  - Recall@50 : 0.9249   |   NDCG@50 : 0.7162
+  -----------------------------------------------------
+
+========================= Period 10 =========================
+--- [Data] Period 10. Rows: 220690, Pos: 178501
+--- Building model: hyper_lora_sasrec ---
+[HyperLoRASASRec] Initialized. FFN weights are modulated by Context.
+--- Loading weights from: ./checkpoints/Meta_Refactored_Experiment_lr0.001/period_9/best_model.pth ---
+Epochs:  10%|█████▋                                                   | 1/10 [01:30<13:36, 90.72s/it, train_loss=5.0442, val_loss=5.0548]
+--- Training finished for period 10. ---
+--- Running Backward Transfer (BWT) Evaluation ---
+    - Period 9 GAUC: 0.9118                                                                                                              
+    - Period 10 GAUC: 0.9220                                                                                                             
+--- Average BWT GAUC: 0.9169 ---
+--- Running Forward Transfer (FWT) Evaluation (Period 11) ---
+                                                                                                                                         
+--- Period 10 (Model) -> Period 11 (Test) Evaluation Finished ---
+  - GAUC     : 0.9266
+  - AUC      : 0.9266
+  -----------------------------------------------------
+  - Recall@5  : 0.8041   |   NDCG@5  : 0.7226
+  - Recall@10 : 0.8595   |   NDCG@10 : 0.7407
+  - Recall@20 : 0.9059   |   NDCG@20 : 0.7524
+  - Recall@50 : 0.9444   |   NDCG@50 : 0.7602
+  -----------------------------------------------------
+
+========================= Period 11 =========================
+--- [Data] Period 11. Rows: 220689, Pos: 176739
+--- Building model: hyper_lora_sasrec ---
+[HyperLoRASASRec] Initialized. FFN weights are modulated by Context.
+--- Loading weights from: ./checkpoints/Meta_Refactored_Experiment_lr0.001/period_10/best_model.pth ---
+Epochs:  10%|█████▋                                                   | 1/10 [01:39<14:51, 99.03s/it, train_loss=4.9426, val_loss=5.2299]
+--- Training finished for period 11. ---
+--- Running Backward Transfer (BWT) Evaluation ---
+    - Period 9 GAUC: 0.8995                                                                                                              
+    - Period 10 GAUC: 0.9043                                                                                                             
+    - Period 11 GAUC: 0.9330                                                                                                             
+--- Average BWT GAUC: 0.9123 ---
+--- Running Forward Transfer (FWT) Evaluation (Period 12) ---
+                                                                                                                                         
+--- Period 11 (Model) -> Period 12 (Test) Evaluation Finished ---
+  - GAUC     : 0.9337
+  - AUC      : 0.9337
+  -----------------------------------------------------
+  - Recall@5  : 0.8046   |   NDCG@5  : 0.7379
+  - Recall@10 : 0.8570   |   NDCG@10 : 0.7548
+  - Recall@20 : 0.9044   |   NDCG@20 : 0.7669
+  - Recall@50 : 0.9540   |   NDCG@50 : 0.7768
+  -----------------------------------------------------
+
+========================= Period 12 =========================
+--- [Data] Period 12. Rows: 220690, Pos: 179435
+--- Building model: hyper_lora_sasrec ---
+[HyperLoRASASRec] Initialized. FFN weights are modulated by Context.
+--- Loading weights from: ./checkpoints/Meta_Refactored_Experiment_lr0.001/period_11/best_model.pth ---
+Epochs:  10%|█████▋                                                   | 1/10 [01:28<13:19, 88.88s/it, train_loss=4.9788, val_loss=5.2292]
+--- Training finished for period 12. ---
+--- Running Backward Transfer (BWT) Evaluation ---
+    - Period 9 GAUC: 0.8755                                                                                                              
+    - Period 10 GAUC: 0.8757                                                                                                             
+    - Period 11 GAUC: 0.9000                                                                                                             
+    - Period 12 GAUC: 0.9155                                                                                                             
+--- Average BWT GAUC: 0.8916 ---
+--- Running Forward Transfer (FWT) Evaluation (Period 13) ---
+                                                                                                                                         
+--- Period 12 (Model) -> Period 13 (Test) Evaluation Finished ---
+  - GAUC     : 0.9180
+  - AUC      : 0.9180
+  -----------------------------------------------------
+  - Recall@5  : 0.7815   |   NDCG@5  : 0.7052
+  - Recall@10 : 0.8358   |   NDCG@10 : 0.7230
+  - Recall@20 : 0.8849   |   NDCG@20 : 0.7354
+  - Recall@50 : 0.9386   |   NDCG@50 : 0.7461
+  -----------------------------------------------------
+
+
+==================== [ Learning Rate 0.001 Summary ] ====================
+
+--- Average Forward Transfer Metrics ---
+  - GAUC     : 0.9104
+  - AUC      : 0.9104
+-------------------------------------------------------
+  - Recall@5  : 0.7600   |   NDCG@5  : 0.6821
+  - Recall@10 : 0.8200   |   NDCG@10 : 0.7016
+  - Recall@20 : 0.8746   |   NDCG@20 : 0.7154
+  - Recall@50 : 0.9316   |   NDCG@50 : 0.7268
+-------------------------------------------------------
+
