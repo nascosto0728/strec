@@ -87,13 +87,13 @@ class EmbMLP(nn.Module):
         self.register_buffer('cate_lens', torch.tensor(cate_lens, dtype=torch.int32))
 
         # --- 建立 Embedding Table ---
-        self.user_emb_w = nn.Embedding(self.hparams['num_users'], self.hparams['user_embed_dim'])
-        self.item_emb_w = nn.Embedding(self.hparams['num_items'], self.hparams['item_embed_dim'])
-        self.cate_emb_w = nn.Embedding(self.hparams['num_cates'], self.hparams['cate_embed_dim'])
+        self.user_emb_w = nn.Embedding(self.hparams['n_users'], self.hparams['user_embed_dim'])
+        self.item_emb_w = nn.Embedding(self.hparams['n_items'], self.hparams['item_embed_dim'])
+        self.cate_emb_w = nn.Embedding(self.hparams['n_cates'], self.hparams['cate_embed_dim'])
 
         # Buffer: 這裡假設 dim = item_embed_dim，與原始程式碼保持一致
         history_embed_dim = self.hparams['item_embed_dim'] 
-        self.user_history_buffer = nn.Embedding(self.hparams['num_items'], history_embed_dim)
+        self.user_history_buffer = nn.Embedding(self.hparams['n_items'], history_embed_dim)
         self.user_history_buffer.weight.requires_grad = False
         
         # --- 建立 MLP (保留原本的雙路徑結構以維持穩定性) ---

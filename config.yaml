@@ -31,8 +31,8 @@ model_type: 'hyper_lora_sasrec'
 model:
   batch_size: 4096
   text_embed_dim: 384
-  user_embed_dim: 32
-  item_embed_dim: 32
-  output_dim: 32
-  cate_embed_dim: 16
-  lora_r: 0 # LoRA rank for hyper_lora_sasrec
+  user_embed_dim: 128
+  item_embed_dim: 128
+  output_dim: 128
+  cate_embed_dim: 64
+  lora_r: 64 # LoRA rank for hyper_lora_sasrec

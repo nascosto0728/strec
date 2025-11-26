@@ -1,461 +1,402 @@
 import os
-import time
 import yaml
 import argparse
+import random
 import numpy as np
 import pandas as pd
-from typing import Dict, Any, List, Tuple
 from tqdm import tqdm
+from typing import Dict, Any, List, Set, Optional
 import copy
-import random
 
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from model import HyperLoRASASRec, SASRec_MLP, EmbMLP
-
+# 引入重構後的模組
+from model import HyperLoRASASRec
 from utils import (
-    prepare_data_from_dfs,
-    RecommendationDataset, 
-    sample_negative_items, 
+    prepare_data_pipeline,
+    RecommendationDataset,
+    sample_negatives_batch
 )
 
-
-
-def _debug_check(name: str, x, verbose: bool = False, raise_on_error: bool = False):
-    """
-    簡易的 NaN / Inf 檢查器。
-    - name: 要印出的變數名稱（方便 log）
-    - x: 要檢查的 tensor（或其他型別）
-    - verbose: 若 True，無問題時也會印出 shape/dtype
-    - raise_on_error: 若發現 NaN/Inf，則拋例外以中斷程式（方便追蹤 stack）
-    """
-    if not torch.is_tensor(x):
-        if verbose:
-            print(f"[DEBUG] {name}: not a tensor (type={type(x)})")
-        return
-
-    try:
-        isnan = torch.isnan(x).any().item()
-        isinf = torch.isinf(x).any().item()
-    except Exception as e:
-        print(f"[DEBUG] {name}: error checking isnan/isinf: {e}")
-        return
-
-    if isnan or isinf:
-        info = f"[DEBUG] {name} INVALID -> isnan={isnan}, isinf={isinf}, shape={tuple(x.shape)}, dtype={x.dtype}, device={x.device}"
-        print(info)
-        # 嘗試印出前幾個元素作為 sample（避免大量輸出）
-        try:
-            sample = x.detach().cpu().view(-1)[:16].tolist()
-            print("  sample:", sample)
-        except Exception:
-            pass
-        if raise_on_error:
-            raise RuntimeError(f"{name} contains NaN/Inf")
-    else:
-        if verbose:
-            print(f"[DEBUG] {name}: ok (shape={tuple(x.shape)}, dtype={x.dtype}, device={x.device})")
-
-# ######################################################################
-# # 輔助函式：模型評估
-# ######################################################################
-
-def run_evaluation(
-    model: torch.nn.Module, 
-    test_loader: DataLoader, 
-    item_history_dict: Dict[int, set], 
-    seen_items_pool: set, 
-    config: Dict[str, Any], 
-    device: torch.device, 
-    Ks: List[int], 
-    sampling_size: int
-) -> Dict[str, float]:
-    """
-    評估函式 (保持不變)
-    """
-    model.eval() 
-    
-    total_recalls = np.zeros(len(Ks))
-    total_ndcgs = np.zeros(len(Ks))
-    all_per_sample_aucs = []
-    all_user_ids_for_gauc = []
-    total_positive_items = 0
-
-    with torch.no_grad():
-        for batch in tqdm(test_loader, desc="Evaluating", leave=False):
-            batch_cpu = {k: v for k, v in batch.items()}
-            batch = {k: v.to(device) for k, v in batch.items()}
-            batch_size = len(batch['users'])
-            total_positive_items += batch_size
-
-            # 1. 負採樣
-            neg_item_ids_list = []
-            for i in range(batch_size):
-                item_j_id = batch['items'][i].item()
-                user_i_id = batch_cpu['users'][i].item()
-                seen_items = item_history_dict.get(user_i_id, set())
-                
-                neg_items = sample_negative_items(
-                    item_pool=seen_items_pool,
-                    seen_items_set=seen_items,
-                    positive_item_id=item_j_id,
-                    num_samples=sampling_size,
-                    device=device
-                )
-                neg_item_ids_list.append(neg_items)
-            
-            neg_item_ids_batch = torch.stack(neg_item_ids_list) 
-
-            # 2. 推論
-            pos_logits, neg_logits, _ = model.inference(batch, neg_item_ids_batch)
-
-            # 3. 排名
-            pos_logits = pos_logits.unsqueeze(1) 
-            all_logits = torch.cat([pos_logits, neg_logits], dim=1) 
-            ranks = (all_logits > pos_logits).sum(dim=1).cpu().numpy()
-
-            # 4. AUC
-            auc_per_sample = (pos_logits > neg_logits).float().mean(dim=1)
-            all_per_sample_aucs.extend(auc_per_sample.cpu().numpy())
-            all_user_ids_for_gauc.extend(batch_cpu['users_raw'].numpy())
-
-            # 5. Recall / NDCG
-            for rank in ranks:
-                for j, k in enumerate(Ks):
-                    if rank < k:
-                        total_recalls[j] += 1
-                        total_ndcgs[j] += 1 / np.log2(rank + 2)
-    
-    metrics = {}
-    if total_positive_items > 0:
-        gauc_df = pd.DataFrame({'user': all_user_ids_for_gauc, 'auc': all_per_sample_aucs})
-        metrics['auc'] = np.mean(all_per_sample_aucs)
-        
-        user_auc_mean = gauc_df.groupby('user')['auc'].mean()
-        user_counts = gauc_df.groupby('user').size()
-        metrics['gauc'] = (user_auc_mean * user_counts).sum() / user_counts.sum()
-        
-        final_recalls = total_recalls / total_positive_items
-        final_ndcgs = total_ndcgs / total_positive_items
-        for k, rec, ndcg in zip(Ks, final_recalls, final_ndcgs):
-            metrics[f'recall@{k}'] = rec
-            metrics[f'ndcg@{k}'] = ndcg
-            
-    return metrics
-
-
-# ######################################################################
-# # 主實驗函式 (Refactored: No ER, No KD, No GNN)
-# ######################################################################
-
-def run_experiment(config: Dict[str, Any]):
-    print("--- 0. Setting up device ---")
-    device = torch.device("cpu")
+def set_seed(seed: int):
+    """固定隨機種子以確保實驗可重現性"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
     if torch.cuda.is_available():
-        device = torch.device("cuda")
-        print("--- Using CUDA. ---")
-    else:
-        print("--- Using CPU. ---")
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    # 確保 CUDA 運算確定性 (會稍微影響效能但對除錯很重要)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
-    random.seed(config.get('seed', 42))
-    torch.manual_seed(config.get('seed', 42))
-    np.random.seed(config.get('seed', 42))
-
-    # --- 1. 數據 I/O ---
-    print("--- 1. Loading raw data files ---")
-    full_data_df = pd.read_parquet(config['data_path'])
-    if config.get('debug_sample', 0) > 0:
-        sample_ratio = config['debug_sample']
-        print(f"--- [DEBUG] Sampling 1/{sample_ratio} of data ---")
-        full_data_df = full_data_df.iloc[::sample_ratio]  
-    full_meta_df = pd.read_parquet(config['meta_path'])
-
-    # --- 2. 數據轉換 ---
-    print("--- 2. Processing and remapping data ---")
-    remapped_full_df, cates, cate_lens, hyperparams_updates, item_map, full_cate_map = prepare_data_from_dfs(
-        full_data_df, full_meta_df, config
-    )
-    hyperparams = {**config['model'], **hyperparams_updates}
-    config['model'] = hyperparams 
-    
-    # 轉換為 NumPy
-    cates_np = np.array(cates)
-    cate_lens_np = np.array(cate_lens)
-    
-    # --- 驗證資料 ---
-    if remapped_full_df.empty:
-        print("!!! FATAL ERROR: remapped_full_df is empty! !!!")
-        return
-    print(f"Total rows: {len(remapped_full_df)}")
-
-    # --- 全局評估資訊 ---
-    sampling_size = config['evaluation'].get('sampling_size', 99)
-    Ks = config['evaluation'].get('Ks', [5, 10, 20, 50])
-
-    # --- 3. 進入學習率調參迴圈 ---
-    for lr in config['learning_rates']:
-        print(f"\n{'='*50}\nStarting run with Learning Rate: {lr}\n{'='*50}")
-        dir_name_with_lr = f"{config['dir_name']}_lr{lr}"
+class StreamingTrainer:
+    """
+    串流推薦實驗控制器。
+    負責：資料載入、模型初始化、週期性訓練 (Incremental Learning)、評估。
+    """
+    def __init__(self, config: Dict[str, Any]):
+        self.cfg = config
+        self.device = self._get_device()
         
-        # 儲存過去的測試 DataLoader，用於回溯評估 (BWT)
-        past_test_loaders = {} 
-        results_over_periods = []
+        # 1. 準備全量資料與 Meta Info
+        # df: 全量資料, meta: {'cate_matrix', ...}, maps: {'user_map', ...}
+        self.full_df, self.global_meta, self.id_maps = prepare_data_pipeline(self.cfg)
         
-        item_history_dict = {} 
-        seen_items_pool = set()
+        # 將 Meta Info 注入 config 供 Model 使用
+        self.cfg['model']['n_users'] = self.global_meta['n_users']
+        self.cfg['model']['n_items'] = self.global_meta['n_items']
+        self.cfg['model']['n_cates'] = self.global_meta['n_cates']
         
-        # --- 4. 增量訓練主迴圈 ---
-        for period_id in range(config['train_start_period'], config['num_periods']):
-            print(f"\n{'='*25} Period {period_id} {'='*25}")
+        # 2. 狀態追蹤器 (State Trackers)
+        # 用於負採樣：記錄每個用戶看過的所有物品 (跨 Period 累績)
+        self.user_history_tracker: Dict[int, Set[int]] = {}
+        # 用於負採樣：記錄所有出現過的物品池
+        self.seen_items_pool: Set[int] = set()
+        
+        # 3. 實驗結果容器
+        self.results_log = []
+
+    def _get_device(self) -> torch.device:
+        if torch.cuda.is_available():
+            print("--- Device: CUDA ---")
+            return torch.device("cuda")
+        else:
+            print("--- Device: CPU ---")
+            return torch.device("cpu")
+
+    def _init_model(self):
+        """根據 Config 初始化模型"""
+        model_type = self.cfg.get('model_type', 'hyper_lora_sasrec')
+        print(f"--- Initializing Model: {model_type} ---")
+        
+        if model_type == 'hyper_lora_sasrec':
+            model = HyperLoRASASRec(self.global_meta['cate_matrix'], self.global_meta['cate_lens'],self.cfg['model'] ,self.cfg).to(self.device)
+        else:
+            raise ValueError(f"Unknown model_type: {model_type}")
             
-            # --- 4.1 資料準備 ---
-            current_period_df = remapped_full_df[remapped_full_df['period'] == period_id]
+        return model
+
+    def _load_prev_period_weights(self, model: torch.nn.Module, period_id: int, lr: float):
+        """嘗試載入上一個 Period 的最佳權重 (模擬串流繼承)"""
+        if period_id <= self.cfg['train_start_period']:
+            return
+
+        prev_dir_name = f"{self.cfg['dir_name']}_lr{lr}"
+        prev_ckpt_path = os.path.join('./checkpoints', prev_dir_name, f'period_{period_id-1}', 'best_model.pth')
+        
+        if os.path.exists(prev_ckpt_path):
+            try:
+                state_dict = torch.load(prev_ckpt_path, map_location=self.device)
+                model.load_state_dict(state_dict)
+                print(f"--- [Init] Weights loaded from Period {period_id-1} ---")
+            except Exception as e:
+                print(f"--- [Warning] Failed to load weights: {e} ---")
+        else:
+            print(f"--- [Init] No checkpoint found for Period {period_id-1}. Training from scratch. ---")
+
+    def _get_dataloader(self, df: pd.DataFrame, shuffle: bool) -> DataLoader:
+        """建立標準 DataLoader"""
+        dataset = RecommendationDataset(df, max_seq_len=30) # 硬編碼 30 或從 config 讀
+        return DataLoader(
+            dataset,
+            batch_size=self.cfg['model']['batch_size'],
+            shuffle=shuffle,
+            num_workers=self.cfg.get('num_workers', 0)
+        )
+
+    def run(self):
+        """執行主實驗流程"""
+        # 針對每個 Learning Rate 跑一次完整的串流實驗
+        for lr in self.cfg['learning_rates']:
+            print(f"\n{'='*60}\n>>> Starting Stream with LR: {lr}\n{'='*60}")
+            self._run_stream_for_lr(lr)
+
+    def _run_stream_for_lr(self, lr: float):
+        """針對單一 LR 的串流迴圈"""
+        # 重置狀態
+        self.user_history_tracker.clear()
+        self.seen_items_pool.clear()
+        self.results_log.clear()
+        
+        # 初始化模型 (每個 LR 重新開始)
+        model = self._init_model()
+
+        # frozen_params_ids = set(map(id, model.encoder_item_seq.parameters())) | \
+        #                     set(map(id, model.encoder_user_seq.parameters())) | \
+        #                     set(map(id, model.hyper_gate_net.parameters()))
+        frozen_params_ids = set()
+        
+        trainable_params = filter(lambda p: id(p) not in frozen_params_ids, model.parameters())
+        optimizer = torch.optim.Adam(
+            trainable_params, 
+            lr=lr, 
+            weight_decay=self.cfg.get('weight_decay', 0.0)
+        )
+
+        # Period Loop
+        start_p = self.cfg['train_start_period']
+        end_p = self.cfg['num_periods']
+        
+        for p_id in range(start_p, end_p):
+            print(f"\n--- Period {p_id} Start ---")
             
-            if current_period_df.empty:
-                print(f"No training data for period {period_id}. Skipping.")
+            # 1. 準備當期資料
+            curr_df = self.full_df[self.full_df['period'] == p_id]
+            if curr_df.empty:
+                print(f"Period {p_id} is empty. Skipping.")
                 continue
-            
-            positive_samples_count = (current_period_df['label'] == 1).sum()
-            print(f"--- [Data] Period {period_id}. Rows: {len(current_period_df)}, Pos: {positive_samples_count}")
-            
-            if positive_samples_count == 0:
-                print(f"--- [Warning] No positive samples. Updating history only.")
-                seen_items_pool.update(current_period_df['itemId'].unique())
-                continue
                 
-            # 準備測試集 (T+1)
-            test_loader_current = None
-            if period_id >= config['test_start_period'] and (period_id + 1) < config['num_periods']:
-                test_set = remapped_full_df[remapped_full_df['period'] == (period_id + 1)].iloc[::5] 
+            
+            # 2. 繼承權重
+            self._load_prev_period_weights(model, p_id, lr)
+            
+            # 3. 準備 DataLoaders
+            # Train / Val Split
+            val_ratio = self.cfg.get('validation_split', 0.2)
+            split_idx = int(len(curr_df) * (1 - val_ratio))
+            train_df = curr_df.iloc[:split_idx]
+            val_df = curr_df.iloc[split_idx:]
+            
+            train_loader = self._get_dataloader(train_df, shuffle=True)
+            val_loader = self._get_dataloader(val_df, shuffle=False) if not val_df.empty else None
+            
+            # 4. 訓練 (Training)
+            best_model_state = self._train_period(model, optimizer, train_loader, val_loader, p_id, lr)
+
+
+            # 5. 更新全域狀態 (History Tracker) 
+            self._update_history_tracker(curr_df)
+            
+            # 6. 載入當期最佳模型進行評估
+            if best_model_state:
+                model.load_state_dict(best_model_state)
                 
-                if not test_set.empty:
-                    test_set_pos = test_set[test_set['label'] == 1].copy()
-                    if not test_set_pos.empty:
-                        test_dataset_pos = RecommendationDataset(test_set_pos, {})
-                        test_loader_current = DataLoader(
-                            test_dataset_pos,
-                            batch_size=config['model']['batch_size'],
-                            shuffle=False,
-                            num_workers=config.get('num_workers', 0)
-                        )
-                        past_test_loaders[period_id + 1] = test_loader_current
-
-            # 更新歷史資訊
-            current_period_interactions_dict = current_period_df.groupby('userId')['itemId'].apply(set).to_dict()
-            for user_id, item_set in current_period_interactions_dict.items():
-                item_history_dict.setdefault(user_id, set()).update(item_set)
-            seen_items_pool.update(current_period_df['itemId'].unique())
-            
-            # --- 4.2 訓練/驗證集切分 ---
-            val_split_ratio = config.get('validation_split', 0.2)
-            if val_split_ratio > 0:
-                split_point = int(len(current_period_df) * (1.0 - val_split_ratio))
-                train_set_final_df = current_period_df.iloc[:split_point]
-                val_set_df = current_period_df.iloc[split_point:]
-            else:
-                train_set_final_df = current_period_df
-                val_set_df = None
-            
-            train_dataset = RecommendationDataset(train_set_final_df, {}) 
-            train_loader = DataLoader(
-                train_dataset, 
-                batch_size=config['model']['batch_size'], 
-                shuffle=True, 
-                num_workers=config.get('num_workers', 0)
-            )
-            
-            val_loader = None
-            if val_set_df is not None and not val_set_df.empty:
-                val_dataset = RecommendationDataset(val_set_df, {})
-                val_loader = DataLoader(
-                    val_dataset,
-                    batch_size=config['model']['batch_size'],
-                    shuffle=False, 
-                    num_workers=config.get('num_workers', 0)
-                )
-
-            # --- 4.3 模型初始化與載入 ---
-            model_type = config.get('model_type', 'hyper_lora_sasrec')
-            print(f"--- Building model: {model_type} ---")
-            
-            if model_type == 'mlp':
-                model = EmbMLP(cates_np, cate_lens_np, hyperparams, config).to(device)
-            elif model_type == 'sasrec':
-                model = SASRec_MLP(cates_np, cate_lens_np, hyperparams, config).to(device)
-            elif model_type == 'hyper_lora_sasrec':
-                model = HyperLoRASASRec(cates_np, cate_lens_np, hyperparams, config).to(device)
-            else:
-                raise ValueError(f"Unknown model_type: {model_type}")
-            
-            transformer_params = list(map(id, model.item_seq_transformer_hyper.parameters())) + \
-                                list(map(id, model.user_seq_transformer_hyper.parameters())) + \
-                                list(map(id, model.hyper_gate_net.parameters()))
-            base_params = filter(lambda p: id(p) not in transformer_params, model.parameters())
-
-            optimizer = torch.optim.Adam([
-                {'params': base_params, 'lr': lr},            # MLP 和 Embedding 正常學習
-                {'params': model.item_seq_transformer_hyper.parameters(), 'lr': lr * 0.1}, # Transformer 慢速微調
-                {'params': model.user_seq_transformer_hyper.parameters(), 'lr': lr * 0.1},
-                {'params': model.hyper_gate_net.parameters(), 'lr': lr * 1}
-            ], weight_decay=config.get('weight_decay', 0.0))
-            # optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=config.get('weight_decay', 0.0))
-
-            # 載入上一期權重 (Streaming Simulation)
-            if period_id > config['train_start_period']:
-                prev_ckpt_dir = os.path.join('./checkpoints', dir_name_with_lr, f'period_{period_id-1}')
-                ckpt_path = os.path.join(prev_ckpt_dir, 'best_model.pth')
-                if os.path.exists(ckpt_path):
-                    try:
-                        print(f"--- Loading weights from: {ckpt_path} ---")
-                        state_dict = torch.load(ckpt_path, map_location=device) 
-                        model.load_state_dict(state_dict)
-                    except Exception as e:
-                        print(f"--- [Warning] Could not load weights: {e} ---")
-                else:
-                    print(f"--- [Warning] No checkpoint found. Training from scratch. ---")
-
-            # --- 5. 訓練迴圈 ---
-            max_epochs = config.get('max_epochs', 10)
-            patience = config.get('patience', 3)
-            patience_counter = 0
-            best_val_loss = float('inf')
-            
-            period_ckpt_dir = os.path.join('./checkpoints', dir_name_with_lr, f'period_{period_id}')
-            os.makedirs(period_ckpt_dir, exist_ok=True)
-            best_model_path = os.path.join(period_ckpt_dir, 'best_model.pth')
-            
-            pbar_epochs = tqdm(range(1, max_epochs + 1), desc="Epochs", leave=True)
-            for epoch_id in pbar_epochs:
-                # (a) 訓練
-                model.train()
-                losses = []
-                for batch in train_loader:
-                    batch = {k: v.to(device) for k, v in batch.items()}
-                    optimizer.zero_grad()
-                    loss = model.calculate_loss(batch) # 這裡不再需要 teacher 參數
-                    
-                    if torch.isnan(loss):
-                        continue
-                                             
-                    loss.backward() 
-
-                    optimizer.step()
-                    losses.append(loss.item())
-
-                if not losses:
-                    break 
-                else:
-                    avg_train_loss = np.mean(losses)
+            # 7. 評估 (Forward Transfer Evaluation on T+1)
+            #    測試集是下一個 Period 的資料
+            next_p_id = p_id + 1
+            if next_p_id < end_p:
+                test_df = self.full_df[self.full_df['period'] == next_p_id]
+                # Optional: Downsample test set for speed
+                # test_df = test_df.iloc[::5] 
                 
-                # (b) 驗證
-                if val_loader is None:
-                    torch.save(model.state_dict(), best_model_path)
+                if not test_df.empty:
+                    # 只評估有正樣本的資料
+                    test_df = test_df[test_df['label'] == 1]
+                    if not test_df.empty:
+                        test_loader = self._get_dataloader(test_df, shuffle=False)
+                        metrics = self._evaluate(model, test_loader, next_p_id)
+                        self.results_log.append(metrics)
+        
+        # End of Stream Summary
+        self._print_summary(lr)
+
+    def _train_period(self, model, optimizer, train_loader, val_loader, p_id, lr):
+        """單一 Period 的訓練迴圈 (含 Early Stopping)"""
+        save_dir = f"./checkpoints/{self.cfg['dir_name']}_lr{lr}/period_{p_id}"
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(save_dir, 'best_model.pth')
+        
+        best_val_loss = float('inf')
+        patience = self.cfg.get('patience', 3)
+        counter = 0
+        best_state = None
+        
+        print(f"Training: {len(train_loader.dataset)} samples. Validation: {len(val_loader.dataset) if val_loader else 0} samples.")
+
+        for epoch in range(1, self.cfg.get('max_epochs', 10) + 1):
+            # --- Train ---
+            model.train()
+            train_losses = []
+            
+            for batch in tqdm(train_loader, desc=f"Ep {epoch}", leave=False):
+                # Move batch to device
+                batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+                
+                optimizer.zero_grad()
+                loss = model.calculate_loss(batch)
+                
+                if torch.isnan(loss):
+                    print("[Warning] NaN loss detected. Skipping batch.")
                     continue
-
+                
+                loss.backward()
+                
+                # [CRITICAL] Gradient Clipping to prevent NaN in Transformer/Embedding
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                
+                optimizer.step()
+                train_losses.append(loss.item())
+                
+            avg_train_loss = np.mean(train_losses) if train_losses else 0.0
+            
+            # --- Validate ---
+            avg_val_loss = float('inf')
+            if val_loader:
                 model.eval()
                 val_losses = []
                 with torch.no_grad():
                     for batch in val_loader:
-                        batch = {k: v.to(device) for k, v in batch.items()}
+                        batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
                         loss = model.calculate_loss(batch)
-                        if not torch.isnan(loss):
-                            val_losses.append(loss.item())
-                        
-                if not val_losses:
-                    avg_val_loss = float('inf')
-                else:
-                    avg_val_loss = np.mean(val_losses)
+                        val_losses.append(loss.item())
+                avg_val_loss = np.mean(val_losses) if val_losses else float('inf')
+            else:
+                # 若無 Val set，直接以 Train loss 為準 (不建議)
+                avg_val_loss = avg_train_loss
 
-                # (c) Early Stopping
-                if avg_val_loss < best_val_loss:
-                    best_val_loss = avg_val_loss
-                    torch.save(model.state_dict(), best_model_path)
-                    patience_counter = 0
-                else:
-                    patience_counter += 1
-
-                if patience_counter >= patience:
-                    break 
-
-                pbar_epochs.set_postfix(train_loss=f"{avg_train_loss:.4f}", val_loss=f"{avg_val_loss:.4f}")
+            # --- Checkpoint & Early Stop ---
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                best_state = copy.deepcopy(model.state_dict())
+                torch.save(best_state, save_path)
+                counter = 0
+            else:
+                counter += 1
+                
+            print(f"  Ep {epoch} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Patience: {counter}/{patience}")
             
-            print(f"--- Training finished for period {period_id}. ---")
-
-            # --- 6. 評估階段 ---
-            if test_loader_current is not None:
-                if os.path.exists(best_model_path):
-                    model.load_state_dict(torch.load(best_model_path, map_location=device))
+            if counter >= patience:
+                print("  Early stopping triggered.")
+                break
                 
-                # 6.1 BWT (Backward Transfer)
-                print(f"--- Running Backward Transfer (BWT) Evaluation ---")
-                backward_metrics_list = []
-                for past_period_id, past_loader in past_test_loaders.items():
-                    if past_period_id == (period_id + 1): continue
-                    
-                    past_metrics = run_evaluation(
-                        model, past_loader, item_history_dict, seen_items_pool, 
-                        config, device, Ks, sampling_size
-                    )
-                    backward_metrics_list.append(past_metrics)
-                    print(f"    - Period {past_period_id} GAUC: {past_metrics.get('gauc', 0.0):.4f}")
-                
-                if backward_metrics_list:
-                    avg_bwt_gauc = np.mean([m.get('gauc', 0.0) for m in backward_metrics_list])
-                    print(f"--- Average BWT GAUC: {avg_bwt_gauc:.4f} ---")
+        return best_state
 
-                # 6.2 FWT (Forward Transfer)
-                print(f"--- Running Forward Transfer (FWT) Evaluation (Period {period_id + 1}) ---")
-                metrics_forward = run_evaluation(
-                    model, test_loader_current, item_history_dict, seen_items_pool, 
-                    config, device, Ks, sampling_size
+    def _evaluate(self, model, test_loader, target_p_id) -> Dict[str, float]:
+        """評估 Forward Transfer"""
+        print(f"--- Evaluating on Period {target_p_id} (FWT) ---")
+        model.eval()
+        
+        Ks = self.cfg['evaluation'].get('Ks', [5, 10, 20])
+        n_neg = self.cfg['evaluation'].get('sampling_size', 99)
+        
+        hits = np.zeros(len(Ks))
+        ndcgs = np.zeros(len(Ks))
+        aucs = []
+        n_pos = 0
+        
+        with torch.no_grad():
+            for batch in tqdm(test_loader, desc="Testing", leave=False):
+                batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+                B = batch['users'].size(0)
+                n_pos += B
+                
+                # 1. 負採樣
+                #    需要 pos_item_id 和 user_id 來排除已看過的
+                neg_ids = sample_negatives_batch(
+                    self.seen_items_pool,
+                    batch['items'],
+                    batch['users'],
+                    self.user_history_tracker,
+                    n_neg,
+                    self.device
                 )
-                results_over_periods.append(metrics_forward)
                 
+                # 2. Inference
+                #    pos_scores: [B], neg_scores: [B, n_neg]
+                pos_scores, neg_scores, _ = model.inference(batch, neg_ids)
                 
-                print(f"\n--- Period {period_id} (Model) -> Period {period_id + 1} (Test) Evaluation Finished ---")
-                print(f"  - GAUC     : {metrics_forward.get('gauc', 0.0):.4f}")
-                print(f"  - AUC      : {metrics_forward.get('auc', 0.0):.4f}")
-                print("  -----------------------------------------------------")
-                if metrics_forward:
-                    for k in Ks:
-                        print(f"  - Recall@{k:<2} : {metrics_forward.get(f'recall@{k}', 0.0):.4f}   |   NDCG@{k:<2} : {metrics_forward.get(f'ndcg@{k}', 0.0):.4f}")
-                else:
-                    print("  - No positive samples for Recall/NDCG in this period.")
-                print("  -----------------------------------------------------")
+                # 3. Metrics Calculation
+                #    Concat -> [B, 1 + n_neg] (Positive is at index 0)
+                all_scores = torch.cat([pos_scores.unsqueeze(1), neg_scores], dim=1)
+                
+                #    Rank: How many items have score > pos_score
+                #    (Using broadcasting)
+                #    Note: This is strictly >. If ties, this counts as better rank.
+                #    If using >=, rank is conservative.
+                ranks = (all_scores > pos_scores.unsqueeze(1)).sum(dim=1).cpu().numpy() # 0-based rank
+                
+                # AUC (Per Query)
+                # pair-wise comparison: mean(pos > neg)
+                auc = (pos_scores.unsqueeze(1) > neg_scores).float().mean(dim=1).cpu().numpy()
+                aucs.extend(auc)
+                
+                # Top-K
+                for i, k in enumerate(Ks):
+                    # rank < k means rank is 0, 1, ..., k-1 (i.e., within top k)
+                    hits[i] += (ranks < k).sum()
+                    
+                    # NDCG: 1 / log2(rank + 2)
+                    # if hit: 1/log2(r+2), else 0
+                    hit_mask = (ranks < k)
+                    ndcgs[i] += (1.0 / np.log2(ranks[hit_mask] + 2)).sum()
 
-        # --- 7. 總結報告 ---
-        if results_over_periods:
-            print(f"\n{'='*20} [ Learning Rate {lr} Summary ] {'='*20}")
-            avg_metrics = {}
-            report_metric_keys = ['gauc', 'auc'] + [f'recall@{k}' for k in Ks] + [f'ndcg@{k}' for k in Ks]
+        # Aggregate
+        metrics = {
+            'period': target_p_id,
+            'gauc': np.mean(aucs) if aucs else 0.0,
+            'auc': np.mean(aucs) if aucs else 0.0 # user-averaged AUC is conceptually GAUC here
+        }
+        for i, k in enumerate(Ks):
+            metrics[f'recall@{k}'] = hits[i] / n_pos if n_pos > 0 else 0.0
+            metrics[f'ndcg@{k}'] = ndcgs[i] / n_pos if n_pos > 0 else 0.0
             
-            for key in report_metric_keys:
-                valid_values = [m.get(key) for m in results_over_periods if m.get(key) is not None and np.isfinite(m.get(key))]
-                avg_metrics[key] = np.mean(valid_values) if valid_values else 0.0
-                
-            print("\n--- Average Forward Transfer Metrics ---")
-            print(f"  - GAUC     : {avg_metrics.get('gauc', 0.0):.4f}")
-            print(f"  - AUC      : {avg_metrics.get('auc', 0.0):.4f}")
-            print("-------------------------------------------------------")
+        # # Print
+        # print(f"  [Result P{target_p_id}] GAUC: {metrics['gauc']:.4f}")
+        # for k in Ks:
+        #      print(f"    R@{k}: {metrics[f'recall@{k}']:.4f} | N@{k}: {metrics[f'ndcg@{k}']:.4f}")
+
+        print(f"\nPeriod {target_p_id} (Test) Evaluation Finished ---")
+        print(f"  - GAUC     : {metrics.get('gauc', 0.0):.4f}")
+        print(f"  - AUC      : {metrics.get('auc', 0.0):.4f}")
+        print("  -----------------------------------------------------")
+        if metrics:
             for k in Ks:
-                print(f"  - Recall@{k:<2} : {avg_metrics.get(f'recall@{k}', 0.0):.4f}   |   NDCG@{k:<2} : {avg_metrics.get(f'ndcg@{k}', 0.0):.4f}")
-            print("-------------------------------------------------------")
+                print(f"  - Recall@{k:<2} : {metrics.get(f'recall@{k}', 0.0):.4f}   |   NDCG@{k:<2} : {metrics.get(f'ndcg@{k}', 0.0):.4f}")
+        else:
+            print("  - No positive samples for Recall/NDCG in this period.")
+        print("  -----------------------------------------------------")
+
+             
+        return metrics
+
+    def _update_history_tracker(self, df: pd.DataFrame):
+        """將當前 DataFrame 的互動紀錄加入全域 History"""
+        # Group by user for efficiency
+        interactions = df.groupby('userId')['itemId'].apply(set).to_dict()
+        for u, items in interactions.items():
+            if u not in self.user_history_tracker:
+                self.user_history_tracker[u] = set()
+            self.user_history_tracker[u].update(items)
             
+        self.seen_items_pool.update(df['itemId'].unique())
+
+    def _print_summary(self, lr):
+        """列印整場實驗的平均指標"""
+        if not self.results_log:
+            return
+            
+        print(f"\n{'='*20} [ Summary for LR {lr} ] {'='*20}")
+        df_res = pd.DataFrame(self.results_log)
+        mean_res = df_res.mean(numeric_only=True)
+        
+        print(f"Avg GAUC: {mean_res.get('gauc', 0):.4f}")
+        for col in mean_res.index:
+            if '@' in col:
+                print(f"Avg {col}: {mean_res[col]:.4f}")
+        print("="*60)
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Streaming Recommendation (Cleaned)")
+    parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, default='config.yaml')
     args = parser.parse_args()
     
+    # Load Config
     try:
         with open(args.config, 'r') as f:
             config = yaml.safe_load(f)
     except FileNotFoundError:
-        print(f"Error: Config not found at {args.config}")
-        exit()
-
-    os.environ['TORCH_USE_CUDA_DSA'] = '1'  # 啟用 CUDA DSA
-    os.environ['CUDA_LAUNCH_BLOCKING'] = '1'  # 啟用 CUDA Launch Blocking
+        print(f"Config file not found: {args.config}")
+        exit(1)
+        
+    # Set Seed
+    set_seed(config.get('seed', 42))
     
-    run_experiment(config)
+    # Enforce Deterministic Behavior for Debugging (Optional)
+    os.environ['TORCH_USE_CUDA_DSA'] = '1'
+    os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+
+    # Run
+    trainer = StreamingTrainer(config)
+    trainer.run()
