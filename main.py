@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader
 
 # 引入重構後的模組
 from model import HyperLoRASASRec
+
 from utils import (
     prepare_data_pipeline,
     RecommendationDataset,
@@ -72,7 +73,7 @@ class StreamingTrainer:
         print(f"--- Initializing Model: {model_type} ---")
         
         if model_type == 'hyper_lora_sasrec':
-            model = HyperLoRASASRec(self.global_meta['cate_matrix'], self.global_meta['cate_lens'],self.cfg['model'] ,self.cfg).to(self.device)
+            model = HyperLoRASASRec(global_meta=self.global_meta, cfg=self.cfg).to(self.device)
         else:
             raise ValueError(f"Unknown model_type: {model_type}")
             
@@ -279,15 +280,15 @@ class StreamingTrainer:
         with torch.no_grad():
             for batch in tqdm(test_loader, desc="Testing", leave=False):
                 batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-                B = batch['users'].size(0)
+                B = batch['user_id'].size(0)
                 n_pos += B
                 
                 # 1. 負採樣
                 #    需要 pos_item_id 和 user_id 來排除已看過的
                 neg_ids = sample_negatives_batch(
                     self.seen_items_pool,
-                    batch['items'],
-                    batch['users'],
+                    batch['item_id'],
+                    batch['user_id'],
                     self.user_history_tracker,
                     n_neg,
                     self.device

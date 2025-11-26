@@ -71,278 +71,6 @@ def average_pooling(embeddings: torch.Tensor, seq_lens: torch.Tensor) -> torch.T
     else:
         raise ValueError(f"Unsupported embedding dimension: {embeddings.dim()}")
 
-
-class EmbMLP(nn.Module):
-    """
-    PAM 模型的基礎版本 (Base MLP)。
-    [Cleaned]: 移除了 item_init_vectors, cate_init_vectors 參數
-    """
-    def __init__(self, cates: np.ndarray, cate_lens: np.ndarray, hyperparams: Dict, train_config: Dict): 
-        super().__init__()
-        self.hparams = hyperparams
-        self.train_config = train_config
-        self.temperature = 0.07
-        
-        self.register_buffer('cates', torch.from_numpy(cates))
-        self.register_buffer('cate_lens', torch.tensor(cate_lens, dtype=torch.int32))
-
-        # --- 建立 Embedding Table ---
-        self.user_emb_w = nn.Embedding(self.hparams['n_users'], self.hparams['user_embed_dim'])
-        self.item_emb_w = nn.Embedding(self.hparams['n_items'], self.hparams['item_embed_dim'])
-        self.cate_emb_w = nn.Embedding(self.hparams['n_cates'], self.hparams['cate_embed_dim'])
-
-        # Buffer: 這裡假設 dim = item_embed_dim，與原始程式碼保持一致
-        history_embed_dim = self.hparams['item_embed_dim'] 
-        self.user_history_buffer = nn.Embedding(self.hparams['n_items'], history_embed_dim)
-        self.user_history_buffer.weight.requires_grad = False
-        
-        # --- 建立 MLP (保留原本的雙路徑結構以維持穩定性) ---
-        concat_dim = self.hparams['user_embed_dim'] + self.hparams['item_embed_dim'] + self.hparams['cate_embed_dim'] 
-        layer_num = 1
-        
-        self.user_mlp = nn.Sequential(*[self.PreNormResidual(concat_dim, self._build_mlp_layers(concat_dim))]*layer_num)
-        self.item_mlp = nn.Sequential(*[self.PreNormResidual(concat_dim, self._build_mlp_layers(concat_dim))]*layer_num)
-        self.user_mlp_2 = nn.Sequential(*[self.PreNormResidual(concat_dim, self._build_mlp_layers(concat_dim))]*layer_num)
-        self.item_mlp_2 = nn.Sequential(*[self.PreNormResidual(concat_dim, self._build_mlp_layers(concat_dim))]*layer_num)
-
-        self._init_weights()
-
-    class PreNormResidual(nn.Module):
-        def __init__(self, dim, fn):
-            super().__init__()
-            self.fn = fn
-            self.norm = nn.LayerNorm(dim)
-
-        def forward(self, x):
-            return self.fn(self.norm(x)) + x
-            
-    def _build_mlp_layers(self, dim, expansion_factor = 2, dropout = 0., dense = nn.Linear):
-        inner_dim = int(dim * expansion_factor)
-        return nn.Sequential(
-            dense(dim, inner_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            dense(inner_dim, dim),
-            nn.Dropout(dropout)
-        )
-    
-    def _init_weights(self):
-        nn.init.xavier_uniform_(self.user_emb_w.weight)
-        nn.init.xavier_uniform_(self.item_emb_w.weight)
-        nn.init.xavier_uniform_(self.cate_emb_w.weight)
-        for mlp in [self.user_mlp, self.item_mlp, self.user_mlp_2, self.item_mlp_2]:
-            for layer in mlp:
-                if isinstance(layer, nn.Linear):
-                    nn.init.xavier_uniform_(layer.weight)
-                    nn.init.zeros_(layer.bias)
-
-    def _build_feature_representations(self, batch: Dict) -> Tuple[torch.Tensor, torch.Tensor]:
-        # User Tower
-        static_u_emb = self.user_emb_w(batch['users'])
-        hist_item_emb = self.item_emb_w(batch['item_history_matrix'])
-        hist_cates = self.cates[batch['item_history_matrix']]
-        hist_cates_len = self.cate_lens[batch['item_history_matrix']]
-        hist_cates_emb = self.cate_emb_w(hist_cates)
-        avg_cate_emb_for_hist = average_pooling(hist_cates_emb, hist_cates_len)
-        hist_item_emb_with_cate = torch.cat([hist_item_emb, avg_cate_emb_for_hist], dim=2)
-        
-        # [Stability] 保留 .detach()
-        user_history_emb = average_pooling(hist_item_emb_with_cate, batch['item_history_len']).detach()
-        user_features = torch.cat([static_u_emb, user_history_emb], dim=-1)
-
-        # Item Tower
-        static_item_emb = self.item_emb_w(batch['items'])
-        item_cates = self.cates[batch['items']]
-        item_cates_len = self.cate_lens[batch['items']]
-        item_cates_emb = self.cate_emb_w(item_cates)
-        avg_cate_emb_for_item = average_pooling(item_cates_emb, item_cates_len)
-        item_emb_with_cate = torch.cat([static_item_emb, avg_cate_emb_for_item], dim=1)
-        item_history_user_emb = self.user_emb_w(batch['user_history_matrix'])
-        
-        # [Stability] 保留 .detach()
-        item_history_emb = average_pooling(item_history_user_emb, batch['user_history_len']).detach()
-        item_features = torch.cat([item_emb_with_cate, item_history_emb], dim=-1)
-
-        if self.training:
-            item_ids = batch['items']
-            self.user_history_buffer.weight[item_ids] = item_history_emb.detach()
-
-        return user_features, item_features
-
-    def _get_embeddings_from_features(self, user_features: torch.Tensor, item_features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        user_embedding = self.user_mlp(user_features) + self.user_mlp_2(user_features)
-        item_embedding = self.item_mlp(item_features) + self.item_mlp_2(item_features)
-        user_embedding = F.normalize(user_embedding, p=2, dim=-1)
-        item_embedding = F.normalize(item_embedding, p=2, dim=-1)
-
-        return user_embedding, item_embedding
-
-    def forward(self, batch: Dict) -> Tuple[torch.Tensor, torch.Tensor]:
-        user_features, item_features = self._build_feature_representations(batch)
-        user_embedding, item_embedding = self._get_embeddings_from_features(user_features, item_features)
-        return user_embedding, item_embedding
-    
-    def _calculate_infonce_loss(self, user_embedding, item_embedding, labels):
-        all_inner_product = torch.matmul(user_embedding, item_embedding.t())
-        logits = all_inner_product / self.temperature
-        logits_max, _ = torch.max(logits, dim=1, keepdim=True)
-        logits_stabilized = logits - logits_max
-        exp_logits_den = torch.exp(logits_stabilized)
-        denominator = exp_logits_den.sum(dim=1, keepdim=True)
-
-        pred_scores = (user_embedding * item_embedding).sum(dim=1, keepdim=True)
-        pred_logits = pred_scores / self.temperature
-        pred_logits_stabilized = pred_logits - logits_max
-        numerator = torch.exp(pred_logits_stabilized)
-
-        infonce_pred = (numerator / (denominator + 1e-9)).squeeze(dim=1)
-        infonce_pred = torch.clamp(infonce_pred, min=1e-9, max=1.0 - 1e-9)
-
-        return F.binary_cross_entropy(infonce_pred, labels.float(), reduction='none')
-    
-    def calculate_loss(self, batch: Dict) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        [Cleaned]: 移除了 teacher_model 和 kd_weight 參數
-        """
-        user_embedding, item_embedding = self.forward(batch)
-        losses = self._calculate_infonce_loss(user_embedding, item_embedding, batch['labels'])
-        final_loss = losses.mean()
-        return final_loss
-        
-    def inference(self, batch: Dict[str, torch.Tensor], neg_item_ids_batch: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        user_features, item_features = self._build_feature_representations(batch)
-        pos_user_emb, pos_item_emb = self._get_embeddings_from_features(user_features, item_features)
-        pos_logits = torch.sum(pos_user_emb * pos_item_emb, dim=1)
-        per_sample_loss = F.binary_cross_entropy_with_logits(pos_logits, batch['labels'].float(), reduction='none')
-
-        num_neg_samples = neg_item_ids_batch.shape[1]
-        neg_item_static_emb = self.item_emb_w(neg_item_ids_batch)
-        neg_item_cate_emb = self.cate_emb_w(self.cates[neg_item_ids_batch])
-        neg_item_cates_len = self.cate_lens[neg_item_ids_batch]
-        avg_cate_emb_for_neg_item = average_pooling(neg_item_cate_emb, neg_item_cates_len)
-        neg_item_history_emb = self.user_history_buffer(neg_item_ids_batch)
-        neg_item_features = torch.cat([neg_item_static_emb, avg_cate_emb_for_neg_item, neg_item_history_emb], dim=2)
-        
-        user_features_expanded = user_features.unsqueeze(1).expand(-1, num_neg_samples, -1)
-        neg_user_emb_final, neg_item_emb_final = self._get_embeddings_from_features(user_features_expanded, neg_item_features)
-        neg_logits = torch.sum(neg_user_emb_final * neg_item_emb_final, dim=2)
-        
-        return pos_logits, neg_logits, per_sample_loss
-
-
-class SASRec_MLP(EmbMLP):
-    """
-    SASRec Upgrade: 使用 Transformer Encoder 替換 AvgPool。
-    """
-    def __init__(self, cates: np.ndarray, cate_lens: np.ndarray, hyperparams: Dict, train_config: Dict): 
-        
-        super().__init__(cates, cate_lens, hyperparams, train_config)
-
-        self.item_dim = self.hparams['item_embed_dim']
-        self.user_dim = self.hparams['user_embed_dim']
-        self.cate_dim = self.hparams['cate_embed_dim']
-        
-        self.item_seq_input_dim = self.item_dim + self.cate_dim
-        self.user_seq_input_dim = self.user_dim
-        
-        self.maxlen = 30
-        n_heads = self.hparams.get('transformer_n_heads', 4)
-        n_layers = self.hparams.get('transformer_n_layers', 2)
-        dropout = self.hparams.get('transformer_dropout', 0.1)
-        
-        # --- 模組 A: itemSeq ---
-        dim_A = self.item_seq_input_dim
-        self.item_seq_pos_emb = nn.Embedding(self.maxlen, dim_A)
-        if dim_A % n_heads != 0:
-            n_heads_A = next(h for h in [4, 2, 1] if dim_A % h == 0)
-        else:
-            n_heads_A = n_heads
-        transformer_layer_A = nn.TransformerEncoderLayer(d_model=dim_A, nhead=n_heads_A, dim_feedforward=dim_A * 4, dropout=dropout, batch_first=True)
-        self.item_seq_transformer = nn.TransformerEncoder(transformer_layer_A, num_layers=n_layers)
-
-        # --- 模組 B: userSeq ---
-        dim_B = self.user_seq_input_dim
-        self.user_seq_pos_emb = nn.Embedding(self.maxlen, dim_B)
-        if dim_B % n_heads != 0:
-            n_heads_B = next(h for h in [4, 2, 1] if dim_B % h == 0)
-        else:
-            n_heads_B = n_heads
-        transformer_layer_B = nn.TransformerEncoderLayer(d_model=dim_B, nhead=n_heads_B, dim_feedforward=dim_B * 4, dropout=dropout, batch_first=True)
-        self.user_seq_transformer = nn.TransformerEncoder(transformer_layer_B, num_layers=n_layers)
-
-
-    def _run_transformer_encoder(self, seq_emb: torch.Tensor, seq_lens: torch.Tensor, transformer_module: nn.TransformerEncoder, pos_emb_module: nn.Embedding) -> torch.Tensor:
-        B, T, D = seq_emb.shape
-        device = seq_emb.device
-        padding_mask = torch.arange(T, device=device)[None, :] >= seq_lens[:, None]
-        pos_ids = torch.arange(T, dtype=torch.long, device=device)
-        pos_embeddings = pos_emb_module(pos_ids).unsqueeze(0) 
-        seq_emb_with_pos = seq_emb + pos_embeddings
-        transformer_output = transformer_module(src=seq_emb_with_pos, src_key_padding_mask=padding_mask)
-        pooled_output = average_pooling(transformer_output, seq_lens)
-        return pooled_output
-
-    def _build_feature_representations(self, batch: Dict) -> Tuple[torch.Tensor, torch.Tensor]:
-        # User Tower
-        static_u_emb = self.user_emb_w(batch['users'])
-        hist_item_emb = self.item_emb_w(batch['item_history_matrix'])
-        hist_cates = self.cates[batch['item_history_matrix']]
-        hist_cates_len = self.cate_lens[batch['item_history_matrix']]
-        hist_cates_emb = self.cate_emb_w(hist_cates)
-        avg_cate_emb_for_hist = average_pooling(hist_cates_emb, hist_cates_len) 
-        hist_item_emb_with_cate = torch.cat([hist_item_emb, avg_cate_emb_for_hist], dim=2) 
-        user_history_emb = self._run_transformer_encoder(hist_item_emb_with_cate, batch['item_history_len'], self.item_seq_transformer, self.item_seq_pos_emb)
-        
-        # [Stability] 保留 .detach()，這很重要！
-        user_features = torch.cat([static_u_emb, user_history_emb.detach()], dim=-1)
-
-        # Item Tower
-        static_item_emb = self.item_emb_w(batch['items'])
-        item_cates = self.cates[batch['items']]
-        item_cates_len = self.cate_lens[batch['items']]
-        item_cates_emb = self.cate_emb_w(item_cates)
-        avg_cate_emb_for_item = average_pooling(item_cates_emb, item_cates_len)
-        item_emb_with_cate = torch.cat([static_item_emb, avg_cate_emb_for_item], dim=1)
-        item_history_user_emb = self.user_emb_w(batch['user_history_matrix'])
-        item_history_emb = self._run_transformer_encoder(item_history_user_emb, batch['user_history_len'], self.user_seq_transformer, self.user_seq_pos_emb)
-        
-        # [Stability] 保留 .detach()
-        item_features = torch.cat([item_emb_with_cate, item_history_emb.detach()], dim=-1)
-
-        # Cache Update
-        item_history_emb_for_cache = item_features[:, -self.user_seq_input_dim:] 
-        if self.training:
-            self.user_history_buffer.weight[batch['items']] = item_history_emb_for_cache.detach()
-        
-        return user_features, item_features
-    
-    def calculate_loss(self, batch: Dict) -> torch.Tensor:
-        student_session_emb, student_item_emb = self.forward(batch)
-        loss_infonce = self._calculate_infonce_loss(student_session_emb, student_item_emb, batch['labels'])
-        loss_main = loss_infonce.mean()
-        return loss_main
-
-    def inference(self, batch: Dict[str, torch.Tensor], neg_item_ids_batch: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        user_features, item_features = self._build_feature_representations(batch)
-        pos_user_emb, pos_item_emb = self._get_embeddings_from_features(user_features, item_features)
-        pos_logits = torch.sum(pos_user_emb * pos_item_emb, dim=1)
-        per_sample_loss = F.binary_cross_entropy_with_logits(pos_logits, batch['labels'].float(), reduction='none')
-
-        num_neg_samples = neg_item_ids_batch.shape[1]
-        neg_item_static_emb = self.item_emb_w(neg_item_ids_batch) 
-        neg_item_cate_emb = self.cate_emb_w(self.cates[neg_item_ids_batch])
-        neg_item_cates_len = self.cate_lens[neg_item_ids_batch]
-        avg_cate_emb_for_neg_item = average_pooling(neg_item_cate_emb, neg_item_cates_len) 
-        neg_item_emb_with_cate = torch.cat([neg_item_static_emb, avg_cate_emb_for_neg_item], dim=2) 
-        
-        item_history_emb_expanded = self.user_history_buffer(neg_item_ids_batch)
-        neg_item_features = torch.cat([neg_item_emb_with_cate, item_history_emb_expanded.detach()], dim=2)
-        user_features_expanded = user_features.unsqueeze(1).expand(-1, num_neg_samples, -1)
-        neg_user_emb_final, neg_item_emb_final = self._get_embeddings_from_features(user_features_expanded, neg_item_features)
-        neg_logits = torch.sum(neg_user_emb_final * neg_item_emb_final, dim=2)
-        
-        return pos_logits, neg_logits, per_sample_loss
-
 class HyperLoRALinear(nn.Module):
     def __init__(self, in_features, out_features, r=8, dropout=0.0):
         super().__init__()
@@ -390,7 +118,7 @@ class HyperLoRATransformerLayer(nn.Module):
         src = src + self.dropout2(ffn_out)
         return src
     
-class HyperLoRASASRec(SASRec_MLP):
+class HyperLoRASASRec(nn.Module):
     """
     Hyper-LoRA SASRec:
     [Cleaned]
@@ -398,15 +126,34 @@ class HyperLoRASASRec(SASRec_MLP):
     2. 清理繼承造成的雙重初始化 (刪除父類 transformer)
     3. 保持 .detach() 確保數值穩定性
     """
-    def __init__(self, cates: np.ndarray, cate_lens: np.ndarray, hyperparams: Dict, train_config: Dict): 
+    def __init__(self, global_meta: Dict[str, Any], cfg: Dict[str, Any]):
+        super().__init__()
         
-        super().__init__(cates, cate_lens, hyperparams, train_config)
-        print("[HyperLoRASASRec] Initialized. FFN weights are modulated by Context.")
+        self.hparams = cfg['model']
+        self.temperature = 0.07
         
-        # [Optimization] 刪除父類初始化的標準 Transformer，避免記憶體浪費
-        if hasattr(self, 'item_seq_transformer'): del self.item_seq_transformer
-        if hasattr(self, 'user_seq_transformer'): del self.user_seq_transformer
+        self.register_buffer('cates', torch.from_numpy(global_meta['cate_matrix']))
+        self.register_buffer('cate_lens', torch.tensor(global_meta['cate_lens'], dtype=torch.int32))
+
+        # --- 建立 Embedding Table ---
+        self.user_emb_w = nn.Embedding(self.hparams['n_users'], self.hparams['user_embed_dim'])
+        self.item_emb_w = nn.Embedding(self.hparams['n_items'], self.hparams['item_embed_dim'])
+        self.cate_emb_w = nn.Embedding(self.hparams['n_cates'], self.hparams['cate_embed_dim'])
+
+        # Buffer: 這裡假設 dim = item_embed_dim，與原始程式碼保持一致
+        history_embed_dim = self.hparams['item_embed_dim'] 
+        self.user_history_buffer = nn.Embedding(self.hparams['n_items'], history_embed_dim)
+        self.user_history_buffer.weight.requires_grad = False
         
+        # --- 建立 MLP (保留原本的雙路徑結構以維持穩定性) ---
+        concat_dim = self.hparams['user_embed_dim'] + self.hparams['item_embed_dim'] + self.hparams['cate_embed_dim'] 
+        layer_num = 1
+        
+        self.user_mlp = nn.Sequential(*[self.PreNormResidual(concat_dim, self._build_mlp_layers(concat_dim))]*layer_num)
+        self.item_mlp = nn.Sequential(*[self.PreNormResidual(concat_dim, self._build_mlp_layers(concat_dim))]*layer_num)
+        self.user_mlp_2 = nn.Sequential(*[self.PreNormResidual(concat_dim, self._build_mlp_layers(concat_dim))]*layer_num)
+        self.item_mlp_2 = nn.Sequential(*[self.PreNormResidual(concat_dim, self._build_mlp_layers(concat_dim))]*layer_num)
+
         self.lora_r = self.hparams.get('lora_r', 16)
         self.context_dim = self.hparams['item_embed_dim']
         
@@ -416,7 +163,21 @@ class HyperLoRASASRec(SASRec_MLP):
             nn.Linear(self.lora_r, self.lora_r),
             nn.Tanh()
         )
+
+        self.maxlen = 30
+        self.item_dim = self.hparams['item_embed_dim']
+        self.user_dim = self.hparams['user_embed_dim']
+        self.cate_dim = self.hparams['cate_embed_dim']
+
+        self.item_seq_input_dim = self.item_dim + self.cate_dim
+        self.user_seq_input_dim = self.user_dim
         
+
+        dim_A = self.item_seq_input_dim
+        self.item_seq_pos_emb = nn.Embedding(self.maxlen, dim_A)
+        dim_B = self.user_seq_input_dim
+        self.user_seq_pos_emb = nn.Embedding(self.maxlen, dim_B)
+
         # 模組 A
         dim_A = self.item_seq_input_dim
         layers_A = nn.ModuleList([
@@ -435,6 +196,37 @@ class HyperLoRASASRec(SASRec_MLP):
         
         self.register_buffer('global_context_ema', torch.zeros(self.context_dim))
         self.ema_alpha = 0.95
+
+        self._init_weights()
+
+    class PreNormResidual(nn.Module):
+        def __init__(self, dim, fn):
+            super().__init__()
+            self.fn = fn
+            self.norm = nn.LayerNorm(dim)
+
+        def forward(self, x):
+            return self.fn(self.norm(x)) + x
+            
+    def _build_mlp_layers(self, dim, expansion_factor = 2, dropout = 0., dense = nn.Linear):
+        inner_dim = int(dim * expansion_factor)
+        return nn.Sequential(
+            dense(dim, inner_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            dense(inner_dim, dim),
+            nn.Dropout(dropout)
+        )
+    
+    def _init_weights(self):
+        nn.init.xavier_uniform_(self.user_emb_w.weight)
+        nn.init.xavier_uniform_(self.item_emb_w.weight)
+        nn.init.xavier_uniform_(self.cate_emb_w.weight)
+        for mlp in [self.user_mlp, self.item_mlp, self.user_mlp_2, self.item_mlp_2]:
+            for layer in mlp:
+                if isinstance(layer, nn.Linear):
+                    nn.init.xavier_uniform_(layer.weight)
+                    nn.init.zeros_(layer.bias)
 
 
     def _update_context_ema(self, current_batch_context):
@@ -479,7 +271,7 @@ class HyperLoRASASRec(SASRec_MLP):
 
     def _build_feature_representations(self, batch: Dict) -> Tuple[torch.Tensor, torch.Tensor]:
 
-        current_items_static = self.item_emb_w(batch['items'])
+        current_items_static = self.item_emb_w(batch['item_id'])
         batch_context = current_items_static.mean(dim=0)
         if self.training:
             self._update_context_ema(batch_context)
@@ -488,28 +280,86 @@ class HyperLoRASASRec(SASRec_MLP):
             context_to_use = self.global_context_ema
             
         # User Tower
-        static_u_emb = self.user_emb_w(batch['users'])
-        hist_item_emb = self.item_emb_w(batch['item_history_matrix'])
-        hist_cates = self.cates[batch['item_history_matrix']]
+        static_u_emb = self.user_emb_w(batch['user_id'])
+        hist_item_emb = self.item_emb_w(batch['user_interacted_items'])
+        hist_cates = self.cates[batch['user_interacted_items']]
         hist_cates_emb = self.cate_emb_w(hist_cates)
-        avg_cate_emb_for_hist = average_pooling(hist_cates_emb, self.cate_lens[batch['item_history_matrix']])
+        avg_cate_emb_for_hist = average_pooling(hist_cates_emb, self.cate_lens[batch['user_interacted_items']])
         hist_item_emb_with_cate = torch.cat([hist_item_emb, avg_cate_emb_for_hist], dim=2).detach()
-        user_history_emb = self._run_hyper_transformer(hist_item_emb_with_cate, batch['item_history_len'], context_to_use, self.item_seq_transformer_hyper, self.item_seq_pos_emb)
+        user_history_emb = self._run_hyper_transformer(hist_item_emb_with_cate, batch['user_interacted_len'], context_to_use, self.item_seq_transformer_hyper, self.item_seq_pos_emb)
         
         # [Stability] 保留 .detach()
         user_features = torch.cat([static_u_emb, user_history_emb], dim=-1)
 
         # Item Tower
-        static_item_emb = self.item_emb_w(batch['items'])
-        item_cates = self.cates[batch['items']] 
+        static_item_emb = self.item_emb_w(batch['item_id'])
+        item_cates = self.cates[batch['item_id']] 
         item_cates_emb = self.cate_emb_w(item_cates)
-        avg_cate_emb_for_item = average_pooling(item_cates_emb, self.cate_lens[batch['items']])
+        avg_cate_emb_for_item = average_pooling(item_cates_emb, self.cate_lens[batch['item_id']])
         item_emb_with_cate = torch.cat([static_item_emb, avg_cate_emb_for_item], dim=1)
-        item_history_user_emb = self.user_emb_w(batch['user_history_matrix']).detach()
-        item_history_emb = self._run_hyper_transformer(item_history_user_emb, batch['user_history_len'], context_to_use, self.user_seq_transformer_hyper, self.user_seq_pos_emb)
+        item_history_user_emb = self.user_emb_w(batch['item_interacted_users']).detach()
+        item_history_emb = self._run_hyper_transformer(item_history_user_emb, batch['item_interacted_len'], context_to_use, self.user_seq_transformer_hyper, self.user_seq_pos_emb)
         
         # [Stability] 保留 .detach()
         item_features = torch.cat([item_emb_with_cate, item_history_emb], dim=-1)
 
         return user_features, item_features
     
+    def _get_embeddings_from_features(self, user_features: torch.Tensor, item_features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        user_embedding = self.user_mlp(user_features) + self.user_mlp_2(user_features)
+        item_embedding = self.item_mlp(item_features) + self.item_mlp_2(item_features)
+        user_embedding = F.normalize(user_embedding, p=2, dim=-1)
+        item_embedding = F.normalize(item_embedding, p=2, dim=-1)
+
+        return user_embedding, item_embedding
+    
+    def forward(self, batch: Dict) -> Tuple[torch.Tensor, torch.Tensor]:
+        user_features, item_features = self._build_feature_representations(batch)
+        user_embedding, item_embedding = self._get_embeddings_from_features(user_features, item_features)
+        return user_embedding, item_embedding
+
+    def _calculate_infonce_loss(self, user_embedding, item_embedding, labels):
+        all_inner_product = torch.matmul(user_embedding, item_embedding.t())
+        logits = all_inner_product / self.temperature
+        logits_max, _ = torch.max(logits, dim=1, keepdim=True)
+        logits_stabilized = logits - logits_max
+        exp_logits_den = torch.exp(logits_stabilized)
+        denominator = exp_logits_den.sum(dim=1, keepdim=True)
+
+        pred_scores = (user_embedding * item_embedding).sum(dim=1, keepdim=True)
+        pred_logits = pred_scores / self.temperature
+        pred_logits_stabilized = pred_logits - logits_max
+        numerator = torch.exp(pred_logits_stabilized)
+
+        infonce_pred = (numerator / (denominator + 1e-9)).squeeze(dim=1)
+        infonce_pred = torch.clamp(infonce_pred, min=1e-9, max=1.0 - 1e-9)
+
+        return F.binary_cross_entropy(infonce_pred, labels.float(), reduction='none')
+    
+    def calculate_loss(self, batch: Dict) -> torch.Tensor:
+        student_session_emb, student_item_emb = self.forward(batch)
+        loss_infonce = self._calculate_infonce_loss(student_session_emb, student_item_emb, batch['labels'])
+        loss_main = loss_infonce.mean()
+        return loss_main
+
+
+    def inference(self, batch: Dict[str, torch.Tensor], neg_item_ids_batch: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        user_features, item_features = self._build_feature_representations(batch)
+        pos_user_emb, pos_item_emb = self._get_embeddings_from_features(user_features, item_features)
+        pos_logits = torch.sum(pos_user_emb * pos_item_emb, dim=1)
+        per_sample_loss = F.binary_cross_entropy_with_logits(pos_logits, batch['labels'].float(), reduction='none')
+
+        num_neg_samples = neg_item_ids_batch.shape[1]
+        neg_item_static_emb = self.item_emb_w(neg_item_ids_batch) 
+        neg_item_cate_emb = self.cate_emb_w(self.cates[neg_item_ids_batch])
+        neg_item_cates_len = self.cate_lens[neg_item_ids_batch]
+        avg_cate_emb_for_neg_item = average_pooling(neg_item_cate_emb, neg_item_cates_len) 
+        neg_item_emb_with_cate = torch.cat([neg_item_static_emb, avg_cate_emb_for_neg_item], dim=2) 
+        
+        item_history_emb_expanded = self.user_history_buffer(neg_item_ids_batch)
+        neg_item_features = torch.cat([neg_item_emb_with_cate, item_history_emb_expanded.detach()], dim=2)
+        user_features_expanded = user_features.unsqueeze(1).expand(-1, num_neg_samples, -1)
+        neg_user_emb_final, neg_item_emb_final = self._get_embeddings_from_features(user_features_expanded, neg_item_features)
+        neg_logits = torch.sum(neg_user_emb_final * neg_item_emb_final, dim=2)
+        
+        return pos_logits, neg_logits, per_sample_loss

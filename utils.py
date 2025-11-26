@@ -50,17 +50,17 @@ class RecommendationDataset(Dataset):
         # 3. 建構回傳字典 (對齊新命名)
         return {
             # IDs
-            'users': int(row['userId']),
-            'items': int(row['itemId']),
+            'user_id': int(row['userId']),
+            'item_id': int(row['itemId']),
             'labels': float(row['label']),
             
             # User Tower Input (User's History)
-            'item_history_matrix': u_seq_padded,
-            'item_history_len': min(len(u_history), self.max_seq_len),
+            'user_interacted_items': u_seq_padded,
+            'user_interacted_len': min(len(u_history), self.max_seq_len),
             
             # Item Tower Input (Item's History)
-            'user_history_matrix': i_seq_padded,
-            'user_history_len': min(len(i_history), self.max_seq_len),
+            'item_interacted_users': i_seq_padded,
+            'item_interacted_len': min(len(i_history), self.max_seq_len),
             
             # Meta info for evaluation
             'user_id_raw': row['userId_raw'],
