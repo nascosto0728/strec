@@ -129,34 +129,57 @@ class HyperLoRASASRec(nn.Module):
     def __init__(self, global_meta: Dict[str, Any], cfg: Dict[str, Any]):
         super().__init__()
         
+        # 1. 配置管理
         self.hparams = cfg['model']
-        self.temperature = 0.07
+        self.temperature = 0.07 # 建議移至 config，但這裡先保持
+        self.maxlen = self.hparams.get('max_seq_len', 30) # 從 config 讀取，預設 30
+        self.lora_r = self.hparams.get('lora_r', 16)
         
+        # 2. 註冊 Buffer (不可訓練的靜態資料)
         self.register_buffer('cates', torch.from_numpy(global_meta['cate_matrix']))
         self.register_buffer('cate_lens', torch.tensor(global_meta['cate_lens'], dtype=torch.int32))
+        
+        # 3. Context EMA 管理
+        self.context_dim = self.hparams['item_embed_dim']
+        self.register_buffer('global_context_ema', torch.zeros(self.context_dim))
+        self.ema_alpha = 0.95
 
-        # --- 建立 Embedding Table ---
+        # 4. 模組構建 (拆分為獨立方法)
+        self._build_embeddings()
+        self._build_hyper_components()
+        self._build_encoders()
+        self._build_prediction_heads()
+        
+        # 5. 初始化權重
+        self._init_weights()
+
+    # ========================================================================
+    #  Builder Methods (解決 __init__ 臃腫問題)
+    # ========================================================================
+
+    def _build_embeddings(self):
+        """初始化所有的 Embedding Layers"""
+        # ID Embeddings
         self.user_emb_w = nn.Embedding(self.hparams['n_users'], self.hparams['user_embed_dim'])
         self.item_emb_w = nn.Embedding(self.hparams['n_items'], self.hparams['item_embed_dim'])
         self.cate_emb_w = nn.Embedding(self.hparams['n_cates'], self.hparams['cate_embed_dim'])
 
-        # Buffer: 這裡假設 dim = item_embed_dim，與原始程式碼保持一致
-        history_embed_dim = self.hparams['item_embed_dim'] 
+        # Positional Embeddings
+        # Item Tower 輸入維度: Item Emb + Category Emb
+        self.item_seq_input_dim = self.hparams['item_embed_dim'] + self.hparams['cate_embed_dim']
+        self.item_seq_pos_emb = nn.Embedding(self.maxlen, self.item_seq_input_dim)
+        
+        # User Tower 輸入維度: User Emb
+        self.user_seq_input_dim = self.hparams['user_embed_dim']
+        self.user_seq_pos_emb = nn.Embedding(self.maxlen, self.user_seq_input_dim)
+
+        # Buffer for Negatives (History)
+        history_embed_dim = self.hparams['item_embed_dim']
         self.user_history_buffer = nn.Embedding(self.hparams['n_items'], history_embed_dim)
         self.user_history_buffer.weight.requires_grad = False
-        
-        # --- 建立 MLP (保留原本的雙路徑結構以維持穩定性) ---
-        concat_dim = self.hparams['user_embed_dim'] + self.hparams['item_embed_dim'] + self.hparams['cate_embed_dim'] 
-        layer_num = 1
-        
-        self.user_mlp = nn.Sequential(*[self.PreNormResidual(concat_dim, self._build_mlp_layers(concat_dim))]*layer_num)
-        self.item_mlp = nn.Sequential(*[self.PreNormResidual(concat_dim, self._build_mlp_layers(concat_dim))]*layer_num)
-        self.user_mlp_2 = nn.Sequential(*[self.PreNormResidual(concat_dim, self._build_mlp_layers(concat_dim))]*layer_num)
-        self.item_mlp_2 = nn.Sequential(*[self.PreNormResidual(concat_dim, self._build_mlp_layers(concat_dim))]*layer_num)
 
-        self.lora_r = self.hparams.get('lora_r', 16)
-        self.context_dim = self.hparams['item_embed_dim']
-        
+    def _build_hyper_components(self):
+        """初始化 HyperNetwork 相關組件"""
         self.hyper_gate_net = nn.Sequential(
             nn.Linear(self.context_dim, self.lora_r),
             nn.Tanh(), 
@@ -164,144 +187,190 @@ class HyperLoRASASRec(nn.Module):
             nn.Tanh()
         )
 
-        self.maxlen = 30
-        self.item_dim = self.hparams['item_embed_dim']
-        self.user_dim = self.hparams['user_embed_dim']
-        self.cate_dim = self.hparams['cate_embed_dim']
-
-        self.item_seq_input_dim = self.item_dim + self.cate_dim
-        self.user_seq_input_dim = self.user_dim
-        
-
-        dim_A = self.item_seq_input_dim
-        self.item_seq_pos_emb = nn.Embedding(self.maxlen, dim_A)
-        dim_B = self.user_seq_input_dim
-        self.user_seq_pos_emb = nn.Embedding(self.maxlen, dim_B)
-
-        # 模組 A
-        dim_A = self.item_seq_input_dim
-        layers_A = nn.ModuleList([
-            HyperLoRATransformerLayer(d_model=dim_A, nhead=self.hparams.get('transformer_n_heads', 4), dim_feedforward=dim_A * 4, dropout=self.hparams.get('transformer_dropout', 0.1), lora_r=self.lora_r)
+    def _build_transformer_block(self, input_dim: int) -> nn.ModuleList:
+        """通用的 Transformer Stack 建構器"""
+        return nn.ModuleList([
+            HyperLoRATransformerLayer(
+                d_model=input_dim,
+                nhead=self.hparams.get('transformer_n_heads', 4),
+                dim_feedforward=input_dim * 4,
+                dropout=self.hparams.get('transformer_dropout', 0.1),
+                lora_r=self.lora_r
+            )
             for _ in range(self.hparams.get('transformer_n_layers', 2))
         ])
-        self.item_seq_transformer_hyper = layers_A 
 
-        # 模組 B
-        dim_B = self.user_seq_input_dim
-        layers_B = nn.ModuleList([
-            HyperLoRATransformerLayer(d_model=dim_B, nhead=self.hparams.get('transformer_n_heads', 4), dim_feedforward=dim_B * 4, dropout=self.hparams.get('transformer_dropout', 0.1), lora_r=self.lora_r)
-            for _ in range(self.hparams.get('transformer_n_layers', 2))
-        ])
-        self.user_seq_transformer_hyper = layers_B
+    def _build_encoders(self):
+        """初始化序列編碼器 (User Tower 和 Item Tower 的 Transformer)"""
+        # User Tower 的序列編碼器 (處理 Item Sequence)
+        self.item_seq_transformer_hyper = self._build_transformer_block(self.item_seq_input_dim)
         
-        self.register_buffer('global_context_ema', torch.zeros(self.context_dim))
-        self.ema_alpha = 0.95
+        # Item Tower 的序列編碼器 (處理 User Sequence)
+        self.user_seq_transformer_hyper = self._build_transformer_block(self.user_seq_input_dim)
 
-        self._init_weights()
+    def _create_mlp(self, input_dim: int) -> nn.Sequential:
+        """通用的 MLP 建構器"""
+        expansion_factor = 2
+        inner_dim = int(input_dim * expansion_factor)
+        dropout = 0.0 # 可以從 config 讀
+        
+        # 定義 PreNormResidual 內部類別或使用 lambda
+        # 為了乾淨，這裡直接用標準寫法，如果需要 Residual 可在 forward 處理或封裝 Block
+        # 為了保持與原本邏輯一致 (PreNormResidual)，這裡保留結構
+        
+        class PreNormResidualBlock(nn.Module):
+            def __init__(self, dim, fn):
+                super().__init__()
+                self.fn = fn
+                self.norm = nn.LayerNorm(dim)
+            def forward(self, x):
+                return self.fn(self.norm(x)) + x
 
-    class PreNormResidual(nn.Module):
-        def __init__(self, dim, fn):
-            super().__init__()
-            self.fn = fn
-            self.norm = nn.LayerNorm(dim)
-
-        def forward(self, x):
-            return self.fn(self.norm(x)) + x
+        def _block():
+            return nn.Sequential(
+                nn.Linear(input_dim, inner_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(inner_dim, input_dim),
+                nn.Dropout(dropout)
+            )
             
-    def _build_mlp_layers(self, dim, expansion_factor = 2, dropout = 0., dense = nn.Linear):
-        inner_dim = int(dim * expansion_factor)
         return nn.Sequential(
-            dense(dim, inner_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            dense(inner_dim, dim),
-            nn.Dropout(dropout)
+            PreNormResidualBlock(input_dim, _block())
         )
-    
+
+    def _build_prediction_heads(self):
+        """初始化最後的 MLP Heads"""
+        concat_dim = self.hparams['user_embed_dim'] + self.hparams['item_embed_dim'] + self.hparams['cate_embed_dim']
+        
+        # 雙塔雙路徑 MLP
+        self.user_mlp = self._create_mlp(concat_dim)
+        self.item_mlp = self._create_mlp(concat_dim)
+        self.user_mlp_2 = self._create_mlp(concat_dim)
+        self.item_mlp_2 = self._create_mlp(concat_dim)
+
     def _init_weights(self):
+        """初始化權重"""
         nn.init.xavier_uniform_(self.user_emb_w.weight)
         nn.init.xavier_uniform_(self.item_emb_w.weight)
         nn.init.xavier_uniform_(self.cate_emb_w.weight)
+        
+        def _init_mlp(m):
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias)
+        
         for mlp in [self.user_mlp, self.item_mlp, self.user_mlp_2, self.item_mlp_2]:
-            for layer in mlp:
-                if isinstance(layer, nn.Linear):
-                    nn.init.xavier_uniform_(layer.weight)
-                    nn.init.zeros_(layer.bias)
+            mlp.apply(_init_mlp)
 
+    # ========================================================================
+    #  Helper Methods for Forward (解決 _build_feature_representations 重複問題)
+    # ========================================================================
 
     def _update_context_ema(self, current_batch_context):
-        self.global_context_ema.data.mul_(self.ema_alpha).add_(current_batch_context.detach(), alpha=(1.0 - self.ema_alpha))
+        self.global_context_ema.data.mul_(self.ema_alpha).add_(
+            current_batch_context.detach(), alpha=(1.0 - self.ema_alpha)
+        )
+
+    def _lookup_item_features(self, item_ids: torch.Tensor) -> torch.Tensor:
+        """
+        統一處理 Item Embedding + Category Pooling
+        包含：User History 裡的 Items 和 Target Items
+        """
+        # 1. Item Static Embedding
+        static_emb = self.item_emb_w(item_ids)
+        
+        # 2. Category Embedding & Pooling
+        item_cates = self.cates[item_ids]
+        item_cates_emb = self.cate_emb_w(item_cates)
+        # 注意：average_pooling 需在外部定義或變成 staticmethod
+        avg_cate_emb = average_pooling(item_cates_emb, self.cate_lens[item_ids])
+        
+        # 3. Concat
+        return torch.cat([static_emb, avg_cate_emb], dim=-1)
 
     def _run_hyper_transformer(self, seq_emb, seq_lens, context_vector, layers_module_list, pos_emb_module):
+        """
+        執行 Transformer 編碼
+        (邏輯保持不變，但建議將此方法作為獨立的 Encoder 類別會更好，這裡先保持為方法)
+        """
         B, T, D = seq_emb.shape
         device = seq_emb.device
         
-        # 1. Generate Gate
-        gate = self.hyper_gate_net(context_vector.unsqueeze(0)).expand(B, -1) # [B, r]
-        
-        # 2. Positional Embedding
+        gate = self.hyper_gate_net(context_vector.unsqueeze(0)).expand(B, -1)
         pos_ids = torch.arange(T, dtype=torch.long, device=device)
         seq_input = seq_emb + pos_emb_module(pos_ids).unsqueeze(0)
         
-        # 3. Masks
-        # Causal Mask (阻止看到未來)
         causal_mask = nn.Transformer.generate_square_subsequent_mask(T, device=device).bool()
-        
-        # [FIX 2] 防止 seq_lens 為 0 導致 Attention NaN
-        # 如果 seq_lens 為 0，我們強制讓它變成 1 (只為了計算 mask 不報錯)
-        # 真正計算完後，我們再用 zero_len_mask 把結果蓋成 0
-        safe_lens = torch.clamp(seq_lens, min=1) 
+        safe_lens = torch.clamp(seq_lens, min=1)
         padding_mask = (torch.arange(T, device=device)[None, :] >= safe_lens[:, None])
         
-        # 4. Forward Layers
         output = seq_input
         for layer in layers_module_list:
             output = layer(output, context_gate=gate, src_mask=causal_mask, src_key_padding_mask=padding_mask)
             
-        # 5. Gather Last Valid Item
-        # 處理 seq_len 為 0 的情況
         target_indices = (seq_lens - 1).clamp(min=0).view(B, 1, 1).expand(-1, 1, D)
         pooled_output = torch.gather(output, 1, target_indices).squeeze(1)
         
-        # 確保 seq_len=0 的輸出為 0 (這一步會切斷 NaN 的傳播)
         mask_zero = (seq_lens == 0).unsqueeze(-1).expand(-1, D)
         pooled_output = pooled_output.masked_fill(mask_zero, 0.0)
         
         return pooled_output
 
     def _build_feature_representations(self, batch: Dict) -> Tuple[torch.Tensor, torch.Tensor]:
-
+        """
+        重構後的特徵構建流程
+        """
+        # --- 1. Context Management ---
+        # 為了計算 Context，我們需要當前 Batch Item 的特徵
+        # 這裡有個細節：原代碼 Context 只用 Item ID Embedding，不含 Category
         current_items_static = self.item_emb_w(batch['item_id'])
         batch_context = current_items_static.mean(dim=0)
+        
         if self.training:
             self._update_context_ema(batch_context)
             context_to_use = batch_context
         else:
             context_to_use = self.global_context_ema
-            
-        # User Tower
-        static_u_emb = self.user_emb_w(batch['user_id'])
-        hist_item_emb = self.item_emb_w(batch['user_interacted_items'])
-        hist_cates = self.cates[batch['user_interacted_items']]
-        hist_cates_emb = self.cate_emb_w(hist_cates)
-        avg_cate_emb_for_hist = average_pooling(hist_cates_emb, self.cate_lens[batch['user_interacted_items']])
-        hist_item_emb_with_cate = torch.cat([hist_item_emb, avg_cate_emb_for_hist], dim=2).detach()
-        user_history_emb = self._run_hyper_transformer(hist_item_emb_with_cate, batch['user_interacted_len'], context_to_use, self.item_seq_transformer_hyper, self.item_seq_pos_emb)
-        
-        # [Stability] 保留 .detach()
-        user_features = torch.cat([static_u_emb, user_history_emb], dim=-1)
 
-        # Item Tower
-        static_item_emb = self.item_emb_w(batch['item_id'])
-        item_cates = self.cates[batch['item_id']] 
-        item_cates_emb = self.cate_emb_w(item_cates)
-        avg_cate_emb_for_item = average_pooling(item_cates_emb, self.cate_lens[batch['item_id']])
-        item_emb_with_cate = torch.cat([static_item_emb, avg_cate_emb_for_item], dim=1)
-        item_history_user_emb = self.user_emb_w(batch['item_interacted_users']).detach()
-        item_history_emb = self._run_hyper_transformer(item_history_user_emb, batch['item_interacted_len'], context_to_use, self.user_seq_transformer_hyper, self.user_seq_pos_emb)
+        # --- 2. User Tower Construction ---
+        # User Static
+        user_static = self.user_emb_w(batch['user_id'])
         
-        # [Stability] 保留 .detach()
-        item_features = torch.cat([item_emb_with_cate, item_history_emb], dim=-1)
+        # User History (Sequence of Items)
+        # 使用提取出的 helper 方法取得 Item+Cate 特徵
+        hist_item_features = self._lookup_item_features(batch['user_interacted_items'])
+        hist_item_features = hist_item_features.detach() # 保持原本的 detach 邏輯
+        
+        user_history_emb = self._run_hyper_transformer(
+            hist_item_features, 
+            batch['user_interacted_len'], 
+            context_to_use, 
+            self.item_seq_transformer_hyper, 
+            self.item_seq_pos_emb
+        )
+        
+        user_features = torch.cat([user_static, user_history_emb.detach()], dim=-1)
+
+        # --- 3. Item Tower Construction ---
+        # Item Static (Sequence of Target Item)
+        # 同樣使用 helper 方法
+        item_composite_static = self._lookup_item_features(batch['item_id'])
+        
+        # Item History (Sequence of Users)
+        # Item Tower 的歷史是 User ID，這部分邏輯與 User Tower 不同，無法共用 lookup
+        item_hist_user_ids = batch['item_interacted_users']
+        item_hist_emb = self.user_emb_w(item_hist_user_ids).detach() # 保持 detach
+        
+        item_history_emb = self._run_hyper_transformer(
+            item_hist_emb, 
+            batch['item_interacted_len'], 
+            context_to_use, 
+            self.user_seq_transformer_hyper, 
+            self.user_seq_pos_emb
+        )
+        
+        item_features = torch.cat([item_composite_static, item_history_emb.detach()], dim=-1)
 
         return user_features, item_features
     

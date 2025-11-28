@@ -333,10 +333,6 @@ class StreamingTrainer:
             metrics[f'recall@{k}'] = hits[i] / n_pos if n_pos > 0 else 0.0
             metrics[f'ndcg@{k}'] = ndcgs[i] / n_pos if n_pos > 0 else 0.0
             
-        # # Print
-        # print(f"  [Result P{target_p_id}] GAUC: {metrics['gauc']:.4f}")
-        # for k in Ks:
-        #      print(f"    R@{k}: {metrics[f'recall@{k}']:.4f} | N@{k}: {metrics[f'ndcg@{k}']:.4f}")
 
         print(f"\nPeriod {target_p_id} (Test) Evaluation Finished ---")
         print(f"  - GAUC     : {metrics.get('gauc', 0.0):.4f}")
@@ -367,16 +363,29 @@ class StreamingTrainer:
         """列印整場實驗的平均指標"""
         if not self.results_log:
             return
+        
+        Ks = self.cfg['evaluation'].get('Ks', [5, 10, 20])
             
         print(f"\n{'='*20} [ Summary for LR {lr} ] {'='*20}")
         df_res = pd.DataFrame(self.results_log)
         mean_res = df_res.mean(numeric_only=True)
         
-        print(f"Avg GAUC: {mean_res.get('gauc', 0):.4f}")
-        for col in mean_res.index:
-            if '@' in col:
-                print(f"Avg {col}: {mean_res[col]:.4f}")
-        print("="*60)
+        # print(f"Avg GAUC: {mean_res.get('gauc', 0):.4f}")
+        # for col in mean_res.index:
+        #     if '@' in col:
+        #         print(f"Avg {col}: {mean_res[col]:.4f}")
+        # print("="*60)
+
+
+        print(f"  - GAUC     : {mean_res.get('gauc', 0.0):.4f}")
+        print(f"  - AUC      : {mean_res.get('auc', 0.0):.4f}")
+        print("  -----------------------------------------------------")
+        if mean_res is not None and not mean_res.empty:
+            for k in Ks:
+                print(f"  - Recall@{k:<2} : {mean_res.get(f'recall@{k}', 0.0):.4f}   |   NDCG@{k:<2} : {mean_res.get(f'ndcg@{k}', 0.0):.4f}")
+        else:
+            print("  - No positive samples for Recall/NDCG in this period.")
+        print("  -----------------------------------------------------")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
