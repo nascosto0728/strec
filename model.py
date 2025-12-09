@@ -153,6 +153,10 @@ class HyperLoRASASRec(nn.Module):
         # 5. 初始化權重
         self._init_weights()
 
+        # [新增] 讀取 Ablation 實驗配置
+        self.ablation_mode = self.hparams.get('ablation_mode', 'baseline') 
+        # 支援模式: 'baseline', 'random_context', 'global_avg', 'no_context_ema'
+
     # ========================================================================
     #  Builder Methods (解決 __init__ 臃腫問題)
     # ========================================================================
@@ -243,11 +247,8 @@ class HyperLoRASASRec(nn.Module):
         """初始化最後的 MLP Heads"""
         concat_dim = self.hparams['user_embed_dim'] + self.hparams['item_embed_dim'] + self.hparams['cate_embed_dim']
         
-        # 雙塔雙路徑 MLP
         self.user_mlp = self._create_mlp(concat_dim)
         self.item_mlp = self._create_mlp(concat_dim)
-        self.user_mlp_2 = self._create_mlp(concat_dim)
-        self.item_mlp_2 = self._create_mlp(concat_dim)
 
     def _init_weights(self):
         """初始化權重"""
@@ -260,7 +261,7 @@ class HyperLoRASASRec(nn.Module):
                 nn.init.xavier_uniform_(m.weight)
                 nn.init.zeros_(m.bias)
         
-        for mlp in [self.user_mlp, self.item_mlp, self.user_mlp_2, self.item_mlp_2]:
+        for mlp in [self.user_mlp, self.item_mlp]:
             mlp.apply(_init_mlp)
 
     # ========================================================================
@@ -316,6 +317,30 @@ class HyperLoRASASRec(nn.Module):
         pooled_output = pooled_output.masked_fill(mask_zero, 0.0)
         
         return pooled_output
+    
+    # [修改] 重構 Context 計算邏輯以支援 Ablation
+    def _get_context_vector(self, batch_item_ids: torch.Tensor) -> torch.Tensor:
+        """
+        根據 Ablation Mode 決定 Context Vector 的來源
+        """
+        batch_size = batch_item_ids.size(0)
+        
+        # 1. Variant A: Random Context (驗證內容有效性)
+        if self.ablation_mode == 'random_context':
+            # 生成與 Batch Size 無關的隨機噪聲，或是每個 Batch 隨機
+            # 這裡我們生成一個隨機向量，模擬 "無意義的 Context"
+            return torch.randn(self.context_dim, device=batch_item_ids.device)
+
+        # 2. Variant B: Global Average Constant (驗證動態性)
+        elif self.ablation_mode == 'global_avg':
+            # 使用所有 Item Embedding 的平均值 (固定常數)
+            # 這裡為了效率，我們假設 item_emb_w.weight 就是全域
+            return self.item_emb_w.weight.mean(dim=0).detach()
+
+        # 3. Baseline: 正常的 Batch Mean
+        else:
+            current_items_static = self.item_emb_w(batch_item_ids)
+            return current_items_static.mean(dim=0)
 
     def _build_feature_representations(self, batch: Dict) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -325,13 +350,24 @@ class HyperLoRASASRec(nn.Module):
         # 為了計算 Context，我們需要當前 Batch Item 的特徵
         # 這裡有個細節：原代碼 Context 只用 Item ID Embedding，不含 Category
         current_items_static = self.item_emb_w(batch['item_id'])
-        batch_context = current_items_static.mean(dim=0)
+        batch_context = self._get_context_vector(batch['item_id'])
         
         if self.training:
-            self._update_context_ema(batch_context)
+            # 只有在非隨機/非固定模式下，更新 EMA 才有意義
+            if self.ablation_mode in ['baseline', 'no_context_ema']:
+                self._update_context_ema(batch_context)
             context_to_use = batch_context
         else:
-            context_to_use = self.global_context_ema
+            # Variant E: No EMA Inference (驗證 Time-Awareness)
+            if self.ablation_mode == 'no_context_ema':
+                # 推論時不使用歷史 EMA，直接使用當前 Batch 的 Context (或是零)
+                # 由於推論時 Batch 可能很小或隨機，這裡我們用 batch_context 測試 "Instant Adaptation"
+                context_to_use = batch_context
+            elif self.ablation_mode in ['random_context', 'global_avg']:
+                context_to_use = batch_context
+            else:
+                # Baseline: 使用累積的 EMA
+                context_to_use = self.global_context_ema
 
         # --- 2. User Tower Construction ---
         # User Static
@@ -350,7 +386,7 @@ class HyperLoRASASRec(nn.Module):
             self.item_seq_pos_emb
         )
         
-        user_features = torch.cat([user_static, user_history_emb.detach()], dim=-1)
+        user_features = torch.cat([user_static, user_history_emb], dim=-1)
 
         # --- 3. Item Tower Construction ---
         # Item Static (Sequence of Target Item)
@@ -370,13 +406,13 @@ class HyperLoRASASRec(nn.Module):
             self.user_seq_pos_emb
         )
         
-        item_features = torch.cat([item_composite_static, item_history_emb.detach()], dim=-1)
+        item_features = torch.cat([item_composite_static, item_history_emb], dim=-1)
 
         return user_features, item_features
     
     def _get_embeddings_from_features(self, user_features: torch.Tensor, item_features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        user_embedding = self.user_mlp(user_features) + self.user_mlp_2(user_features)
-        item_embedding = self.item_mlp(item_features) + self.item_mlp_2(item_features)
+        user_embedding = self.user_mlp(user_features) #+ self.user_mlp_2(user_features)
+        item_embedding = self.item_mlp(item_features) #+ self.item_mlp_2(item_features)
         user_embedding = F.normalize(user_embedding, p=2, dim=-1)
         item_embedding = F.normalize(item_embedding, p=2, dim=-1)
 

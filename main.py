@@ -123,10 +123,6 @@ class StreamingTrainer:
         
         # 初始化模型 (每個 LR 重新開始)
         model = self._init_model()
-
-        # frozen_params_ids = set(map(id, model.encoder_item_seq.parameters())) | \
-        #                     set(map(id, model.encoder_user_seq.parameters())) | \
-        #                     set(map(id, model.hyper_gate_net.parameters()))
         frozen_params_ids = set()
         
         trainable_params = filter(lambda p: id(p) not in frozen_params_ids, model.parameters())
@@ -182,7 +178,7 @@ class StreamingTrainer:
                 # Optional: Downsample test set for speed
                 # test_df = test_df.iloc[::5] 
                 
-                if not test_df.empty:
+                if next_p_id >= self.cfg.get('test_start_period', 8):
                     # 只評估有正樣本的資料
                     test_df = test_df[test_df['label'] == 1]
                     if not test_df.empty:
@@ -291,7 +287,8 @@ class StreamingTrainer:
                     batch['user_id'],
                     self.user_history_tracker,
                     n_neg,
-                    self.device
+                    self.device,
+                    n_items=self.global_meta['n_items']
                 )
                 
                 # 2. Inference

@@ -36,3 +36,12 @@ model:
   output_dim: 128
   cate_embed_dim: 64
   lora_r: 64 # LoRA rank for hyper_lora_sasrec
+
+
+  # === [實驗控制開關] ===
+  # 選項: 
+  #   'baseline'       : 原始完整模型 (Batch Mean + EMA Inference)
+  #   'random_context' : Variant A (隨機噪聲 Context)
+  #   'no_context_ema' : Variant E (推論時不看歷史，只看當下)
+  #   'global_avg'     : Variant B (全域平均，無動態變化)
+  ablation_mode: 'no_context_ema'

@@ -1,0 +1,116 @@
+
+ - GAUC     : 0.8216                                                                                       [55/1698]
+  - AUC      : 0.8216                                                                                                
+  -----------------------------------------------------                                                              
+  - Recall@5  : 0.5323   |   NDCG@5  : 0.4525                                                                        
+  - Recall@10 : 0.6190   |   NDCG@10 : 0.4805                                                                        
+  - Recall@20 : 0.7162   |   NDCG@20 : 0.5050                                                                        
+  - Recall@50 : 0.8568   |   NDCG@50 : 0.5329                                                                        
+  -----------------------------------------------------                                                              
+                                                                                                                     
+--- Period 8 Start ---                                                                                               
+--- [Init] Weights loaded from Period 7 ---                                                                          
+Training: 176551 samples. Validation: 44138 samples.                                                                 
+  Ep 1 | Train Loss: 6.3576 | Val Loss: 6.2475 | Patience: 0/1                                                       
+  Ep 2 | Train Loss: 6.2310 | Val Loss: 6.2715 | Patience: 1/1                                                       
+  Early stopping triggered.                                                                                          
+--- Evaluating on Period 9 (FWT) ---                                                                                 
+                                                                                                                     
+Period 9 (Test) Evaluation Finished ---                                                                              
+  - GAUC     : 0.7904                                                                                                
+  - AUC      : 0.7904                                                                                                
+  -----------------------------------------------------                                                              
+  - Recall@5  : 0.4731   |   NDCG@5  : 0.3958                                                                        
+  - Recall@10 : 0.5619   |   NDCG@10 : 0.4244                                                                        
+  - Recall@20 : 0.6675   |   NDCG@20 : 0.4510                                                                        
+  - Recall@50 : 0.8272   |   NDCG@50 : 0.4828                                                                        
+  -----------------------------------------------------                                                              
+                                                                                                                     
+--- Period 9 Start ---                                                                                               
+--- [Init] Weights loaded from Period 8 ---                                                                          
+Training: 176552 samples. Validation: 44138 samples.                                                                 
+  Ep 1 | Train Loss: 6.2105 | Val Loss: 6.3328 | Patience: 0/1                                                       
+  Ep 2 | Train Loss: 6.0615 | Val Loss: 6.3587 | Patience: 1/1                                                       
+  Early stopping triggered.                                                                                          
+--- Evaluating on Period 10 (FWT) ---                                                                                
+                                                                                                                     
+Period 10 (Test) Evaluation Finished ---                                                                             
+  - GAUC     : 0.8726                                                                                                
+  - AUC      : 0.8726                                                                                                
+  -----------------------------------------------------                                                              
+  - Recall@5  : 0.6239   |   NDCG@5  : 0.5394                                                                        
+  - Recall@10 : 0.7069   |   NDCG@10 : 0.5663                                                                        
+  - Recall@20 : 0.7923   |   NDCG@20 : 0.5878                                                                        
+  - Recall@50 : 0.9076   |   NDCG@50 : 0.6108                                                                        
+  -----------------------------------------------------                                                              
+                                                                                                                     
+--- Period 10 Start ---                                                                                              
+--- [Init] Weights loaded from Period 9 ---                                                                          
+Training: 176552 samples. Validation: 44138 samples.                                                                 
+  Ep 1 | Train Loss: 6.2180 | Val Loss: 6.1752 | Patience: 0/1                                                       
+  Ep 2 | Train Loss: 6.0714 | Val Loss: 6.2051 | Patience: 1/1                                                       
+  Early stopping triggered.                                                                                          
+--- Evaluating on Period 11 (FWT) ---                                                                                
+                                                                                                                     
+Period 11 (Test) Evaluation Finished ---                                                                             
+  - GAUC     : 0.8790                                                                                                
+  - AUC      : 0.8790                                                                                                
+  -----------------------------------------------------
+  - Recall@5  : 0.6223   |   NDCG@5  : 0.5328
+  - Recall@10 : 0.7103   |   NDCG@10 : 0.5612
+  - Recall@20 : 0.8008   |   NDCG@20 : 0.5841
+  - Recall@50 : 0.9169   |   NDCG@50 : 0.6073
+  -----------------------------------------------------
+
+--- Period 11 Start ---
+--- [Init] Weights loaded from Period 10 ---
+Training: 176551 samples. Validation: 44138 samples.
+  Ep 1 | Train Loss: 6.0973 | Val Loss: 6.3899 | Patience: 0/1                                                       
+  Ep 2 | Train Loss: 5.9569 | Val Loss: 6.4380 | Patience: 1/1                                                       
+  Early stopping triggered.
+--- Evaluating on Period 12 (FWT) ---
+                                                                                                                     
+Period 12 (Test) Evaluation Finished ---
+  - GAUC     : 0.8737
+  - AUC      : 0.8737
+  -----------------------------------------------------
+  - Recall@5  : 0.6434   |   NDCG@5  : 0.5640
+  - Recall@10 : 0.7189   |   NDCG@10 : 0.5884
+  - Recall@20 : 0.7993   |   NDCG@20 : 0.6087
+  - Recall@50 : 0.9059   |   NDCG@50 : 0.6299
+  -----------------------------------------------------
+
+--- Period 12 Start ---
+--- [Init] Weights loaded from Period 11 ---
+Training: 176552 samples. Validation: 44138 samples.
+  Ep 1 | Train Loss: 6.1574 | Val Loss: 6.3929 | Patience: 0/1                                                       
+  Ep 2 | Train Loss: 6.0149 | Val Loss: 6.4393 | Patience: 1/1                                                       
+  Early stopping triggered.
+--- Evaluating on Period 13 (FWT) ---
+                                                                                                                     
+Period 13 (Test) Evaluation Finished ---
+  - GAUC     : 0.8770
+  - AUC      : 0.8770
+  -----------------------------------------------------
+  - Recall@5  : 0.6438   |   NDCG@5  : 0.5618
+  - Recall@10 : 0.7220   |   NDCG@10 : 0.5871
+  - Recall@20 : 0.8025   |   NDCG@20 : 0.6075
+  - Recall@50 : 0.9085   |   NDCG@50 : 0.6286
+  -----------------------------------------------------
+
+--- Period 13 Start ---
+--- [Init] Weights loaded from Period 12 ---
+Training: 176551 samples. Validation: 44138 samples.
+  Ep 1 | Train Loss: 5.8942 | Val Loss: 5.9420 | Patience: 0/1                                                       
+  Ep 2 | Train Loss: 5.7621 | Val Loss: 5.9727 | Patience: 1/1                                                       
+  Early stopping triggered.
+
+==================== [ Summary for LR 0.001 ] ====================
+  - GAUC     : 0.8524
+  - AUC      : 0.8524
+  -----------------------------------------------------
+  - Recall@5  : 0.5898   |   NDCG@5  : 0.5077
+  - Recall@10 : 0.6732   |   NDCG@10 : 0.5347
+  - Recall@20 : 0.7631   |   NDCG@20 : 0.5574
+  - Recall@50 : 0.8872   |   NDCG@50 : 0.5820
+  -----------------------------------------------------
