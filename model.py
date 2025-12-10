@@ -72,34 +72,62 @@ def average_pooling(embeddings: torch.Tensor, seq_lens: torch.Tensor) -> torch.T
         raise ValueError(f"Unsupported embedding dimension: {embeddings.dim()}")
 
 class HyperLoRALinear(nn.Module):
-    def __init__(self, in_features, out_features, r=8, dropout=0.0):
+    def __init__(self, in_features, out_features, r=8, dropout=0.0, use_lora=True):
         super().__init__()
+        self.use_lora = use_lora
+        self.in_features = in_features
+        self.out_features = out_features
+        
+        # Base Linear Layer
         self.base = nn.Linear(in_features, out_features)
-        self.lora_down = nn.Linear(in_features, r, bias=False)
-        self.lora_up = nn.Linear(r, out_features, bias=False)
         self.dropout = nn.Dropout(dropout)
-        nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
-        nn.init.zeros_(self.lora_up.weight) 
+        
+        if self.use_lora:
+            # [原始模式] LoRA 分支
+            self.lora_down = nn.Linear(in_features, r, bias=False)
+            self.lora_up = nn.Linear(r, out_features, bias=False)
+            nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
+            nn.init.zeros_(self.lora_up.weight)
+        else:
+            # [實驗 F] 無 LoRA，只有 Gating
+            self.lora_down = None
+            self.lora_up = None
         
     def forward(self, x, context_gate):
         base_out = self.base(x)
-        down_out = self.lora_down(x)
+        
+        # 處理 Gate 維度 (Batch, Dim) -> (Batch, 1, Dim) 以支援序列廣播
         if context_gate.dim() == 2:
-            gate = context_gate.unsqueeze(1) 
+            gate = context_gate.unsqueeze(1)
         else:
             gate = context_gate
-        gated_down = down_out * gate
-        lora_out = self.lora_up(gated_down)
-        return base_out + self.dropout(lora_out)
-    
+
+        if self.use_lora:
+            # Original: Base + LoRA(x * Gate)
+            down_out = self.lora_down(x)
+            gated_down = down_out * gate
+            lora_out = self.lora_up(gated_down)
+            return base_out + self.dropout(lora_out)
+        else:
+            # Experiment F: Base(x) * Gate
+            # 只有當 Gate 維度與 Output 維度一致時才應用 Gating
+            # (例如 FFN 的第二層: dim_feedforward -> d_model)
+            if gate.size(-1) == self.out_features:
+                return base_out * gate
+            else:
+                # 維度不符 (例如 FFN 第一層 expansion)，不做 Gating，僅回傳 Base
+                return base_out
 
 class HyperLoRATransformerLayer(nn.Module):
-    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1, lora_r=8):
+    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1, lora_r=8, use_lora=True):
         super().__init__()
         self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
-        self.linear1 = HyperLoRALinear(d_model, dim_feedforward, r=lora_r, dropout=dropout)
+        
+        # 傳入 use_lora 參數
+        self.linear1 = HyperLoRALinear(d_model, dim_feedforward, r=lora_r, dropout=dropout, use_lora=use_lora)
         self.dropout = nn.Dropout(dropout)
-        self.linear2 = HyperLoRALinear(dim_feedforward, d_model, r=lora_r, dropout=dropout)
+        self.linear2 = HyperLoRALinear(dim_feedforward, d_model, r=lora_r, dropout=dropout, use_lora=use_lora)
+        
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.dropout1 = nn.Dropout(dropout)
@@ -107,9 +135,12 @@ class HyperLoRATransformerLayer(nn.Module):
         self.activation = F.relu
 
     def forward(self, src, context_gate, src_mask=None, src_key_padding_mask=None):
+        # Attention Block (保持不變)
         src2 = self.norm1(src)
         attn_output, _ = self.self_attn(src2, src2, src2, attn_mask=src_mask, key_padding_mask=src_key_padding_mask)
         src = src + self.dropout1(attn_output)
+        
+        # FFN Block (HyperLoRA or Gated Linear inside)
         src2 = self.norm2(src)
         ffn_out = self.linear1(src2, context_gate) 
         ffn_out = self.activation(ffn_out)
@@ -117,7 +148,7 @@ class HyperLoRATransformerLayer(nn.Module):
         ffn_out = self.linear2(ffn_out, context_gate)
         src = src + self.dropout2(ffn_out)
         return src
-    
+        
 class HyperLoRASASRec(nn.Module):
     """
     Hyper-LoRA SASRec:
@@ -134,6 +165,17 @@ class HyperLoRASASRec(nn.Module):
         self.temperature = 0.07 # 建議移至 config，但這裡先保持
         self.maxlen = self.hparams.get('max_seq_len', 30) # 從 config 讀取，預設 30
         self.lora_r = self.hparams.get('lora_r', 16)
+
+        # [實驗 F 設定]
+        self.use_lora = self.hparams.get('use_lora', True)
+        if self.use_lora:
+            self.gate_dim = self.hparams.get('lora_r', 16) # LoRA 模式用 Rank 維度
+        else:
+            # 無 LoRA 模式：Gate 直接作用於 Output，維度需等於 embedding dim
+            # 這裡假設 User Tower 和 Item Tower 的 d_model 一樣，或是 Gate Net 輸出較大的維度
+            # 為了簡單起見，我們將 Gate Dim 設為 User/Item Embedding Dim (假設兩者相同)
+            self.gate_dim = self.hparams['item_embed_dim'] 
+            print(f"--- [Experiment F] LoRA Disabled. Gate Dim set to {self.gate_dim} for Element-wise Gating ---")
         
         # 2. 註冊 Buffer (不可訓練的靜態資料)
         self.register_buffer('cates', torch.from_numpy(global_meta['cate_matrix']))
@@ -152,10 +194,6 @@ class HyperLoRASASRec(nn.Module):
         
         # 5. 初始化權重
         self._init_weights()
-
-        # [新增] 讀取 Ablation 實驗配置
-        self.ablation_mode = self.hparams.get('ablation_mode', 'baseline') 
-        # 支援模式: 'baseline', 'random_context', 'global_avg', 'no_context_ema'
 
     # ========================================================================
     #  Builder Methods (解決 __init__ 臃腫問題)
@@ -183,23 +221,28 @@ class HyperLoRASASRec(nn.Module):
         self.user_history_buffer.weight.requires_grad = False
 
     def _build_hyper_components(self):
-        """初始化 HyperNetwork 相關組件"""
+        """
+        初始化 HyperNetwork，輸出維度根據 use_lora 動態調整
+        """
         self.hyper_gate_net = nn.Sequential(
-            nn.Linear(self.context_dim, self.lora_r),
+            nn.Linear(self.context_dim, self.gate_dim), # 輸出 gate_dim
             nn.Tanh(), 
-            nn.Linear(self.lora_r, self.lora_r),
+            nn.Linear(self.gate_dim, self.gate_dim),
             nn.Tanh()
         )
 
     def _build_transformer_block(self, input_dim: int) -> nn.ModuleList:
-        """通用的 Transformer Stack 建構器"""
+        """
+        傳遞 use_lora 與 gate_dim (lora_r)
+        """
         return nn.ModuleList([
             HyperLoRATransformerLayer(
                 d_model=input_dim,
                 nhead=self.hparams.get('transformer_n_heads', 4),
                 dim_feedforward=input_dim * 4,
                 dropout=self.hparams.get('transformer_dropout', 0.1),
-                lora_r=self.lora_r
+                lora_r=self.gate_dim, # 傳入計算好的 dimension
+                use_lora=self.use_lora # 傳入開關
             )
             for _ in range(self.hparams.get('transformer_n_layers', 2))
         ])
@@ -247,6 +290,7 @@ class HyperLoRASASRec(nn.Module):
         """初始化最後的 MLP Heads"""
         concat_dim = self.hparams['user_embed_dim'] + self.hparams['item_embed_dim'] + self.hparams['cate_embed_dim']
         
+        # 雙塔雙路徑 MLP
         self.user_mlp = self._create_mlp(concat_dim)
         self.item_mlp = self._create_mlp(concat_dim)
 
@@ -317,30 +361,6 @@ class HyperLoRASASRec(nn.Module):
         pooled_output = pooled_output.masked_fill(mask_zero, 0.0)
         
         return pooled_output
-    
-    # [修改] 重構 Context 計算邏輯以支援 Ablation
-    def _get_context_vector(self, batch_item_ids: torch.Tensor) -> torch.Tensor:
-        """
-        根據 Ablation Mode 決定 Context Vector 的來源
-        """
-        batch_size = batch_item_ids.size(0)
-        
-        # 1. Variant A: Random Context (驗證內容有效性)
-        if self.ablation_mode == 'random_context':
-            # 生成與 Batch Size 無關的隨機噪聲，或是每個 Batch 隨機
-            # 這裡我們生成一個隨機向量，模擬 "無意義的 Context"
-            return torch.randn(self.context_dim, device=batch_item_ids.device)
-
-        # 2. Variant B: Global Average Constant (驗證動態性)
-        elif self.ablation_mode == 'global_avg':
-            # 使用所有 Item Embedding 的平均值 (固定常數)
-            # 這裡為了效率，我們假設 item_emb_w.weight 就是全域
-            return self.item_emb_w.weight.mean(dim=0).detach()
-
-        # 3. Baseline: 正常的 Batch Mean
-        else:
-            current_items_static = self.item_emb_w(batch_item_ids)
-            return current_items_static.mean(dim=0)
 
     def _build_feature_representations(self, batch: Dict) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -350,24 +370,13 @@ class HyperLoRASASRec(nn.Module):
         # 為了計算 Context，我們需要當前 Batch Item 的特徵
         # 這裡有個細節：原代碼 Context 只用 Item ID Embedding，不含 Category
         current_items_static = self.item_emb_w(batch['item_id'])
-        batch_context = self._get_context_vector(batch['item_id'])
+        batch_context = current_items_static.mean(dim=0)
         
         if self.training:
-            # 只有在非隨機/非固定模式下，更新 EMA 才有意義
-            if self.ablation_mode in ['baseline', 'no_context_ema']:
-                self._update_context_ema(batch_context)
+            self._update_context_ema(batch_context)
             context_to_use = batch_context
         else:
-            # Variant E: No EMA Inference (驗證 Time-Awareness)
-            if self.ablation_mode == 'no_context_ema':
-                # 推論時不使用歷史 EMA，直接使用當前 Batch 的 Context (或是零)
-                # 由於推論時 Batch 可能很小或隨機，這裡我們用 batch_context 測試 "Instant Adaptation"
-                context_to_use = batch_context
-            elif self.ablation_mode in ['random_context', 'global_avg']:
-                context_to_use = batch_context
-            else:
-                # Baseline: 使用累積的 EMA
-                context_to_use = self.global_context_ema
+            context_to_use = self.global_context_ema
 
         # --- 2. User Tower Construction ---
         # User Static

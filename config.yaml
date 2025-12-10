@@ -36,6 +36,7 @@ model:
   output_dim: 128
   cate_embed_dim: 64
   lora_r: 64 # LoRA rank for hyper_lora_sasrec
+  use_lora: false
 
 
   # === [實驗控制開關] ===
