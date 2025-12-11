@@ -398,7 +398,7 @@ if __name__ == "__main__":
         exit(1)
         
     # Set Seed
-    set_seed(config.get('seed', 9374))
+    set_seed(config.get('seed', 42))
     
     # Enforce Deterministic Behavior for Debugging (Optional)
     os.environ['TORCH_USE_CUDA_DSA'] = '1'

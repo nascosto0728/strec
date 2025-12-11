@@ -37,7 +37,6 @@ model:
   cate_embed_dim: 64
   lora_r: 64 # LoRA rank for hyper_lora_sasrec
 
-  use_lora: true
   use_gated_attention: true      # 是否在 Attention 後加入 Gating
   gating_source: 'token'         # 選項: 'token' (論文做法) 或 'context' (HyperNet做法)
 

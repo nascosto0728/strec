@@ -401,7 +401,7 @@ class HyperLoRASASRec(nn.Module):
 
         # Cache Update
         if self.training:
-            self.user_history_buffer.weight[batch['items']] = item_history_emb.detach()
+            self.user_history_buffer.weight[batch['item_id']] = item_history_emb.detach()
         
 
         return user_features, item_features
