@@ -399,6 +399,11 @@ class HyperLoRASASRec(nn.Module):
         )
         item_features = torch.cat([item_composite_static, item_history_emb], dim=-1)
 
+        # Cache Update
+        if self.training:
+            self.user_history_buffer.weight[batch['items']] = item_history_emb.detach()
+        
+
         return user_features, item_features
     
     def _get_embeddings_from_features(self, user_features: torch.Tensor, item_features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
