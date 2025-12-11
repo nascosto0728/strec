@@ -1,3 +1,4 @@
-no_context_ema(Variant E)~=baseline > global_avg(Variant B)~=random_context(Variant A)
+no_context_ema(Variant E)~= baseline > global_avg(Variant B)~=random_context(Variant A)
 
-(mlp) lora gate > token gate(但是少了item tower)
+lora gate > token gate(但是少了item tower).  (mlp) 
+no gate >= token gate~=context gate         (after attention) 

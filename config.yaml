@@ -36,13 +36,8 @@ model:
   output_dim: 128
   cate_embed_dim: 64
   lora_r: 64 # LoRA rank for hyper_lora_sasrec
-  use_lora: false
 
+  use_lora: true
+  use_gated_attention: true      # 是否在 Attention 後加入 Gating
+  gating_source: 'token'         # 選項: 'token' (論文做法) 或 'context' (HyperNet做法)
 
-  # === [實驗控制開關] ===
-  # 選項: 
-  #   'baseline'       : 原始完整模型 (Batch Mean + EMA Inference)
-  #   'random_context' : Variant A (隨機噪聲 Context)
-  #   'no_context_ema' : Variant E (推論時不看歷史，只看當下)
-  #   'global_avg'     : Variant B (全域平均，無動態變化)
-  ablation_mode: 'no_context_ema'
