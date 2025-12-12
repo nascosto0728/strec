@@ -1,5 +1,5 @@
 # Data paths
-data_path: './datasets/record_movielens.parquet'
+data_path: './datasets/record_movielens_paper.parquet'
 meta_path: './datasets/content_movielens.parquet'
 
 # Experiment settings
@@ -16,7 +16,7 @@ max_epochs: 10         # 每個 period 最多跑 100 個 epoch
 validation_split: 0.2   # 從「當前 period」切 20% 出來當驗證集
 patience: 1            # 驗證集損失 (val_loss) 連續 10 次沒進步就停止
 
-debug_sample: 0
+debug_sample: 10000
 
 evaluation:
   sampling_size: 99
@@ -25,8 +25,8 @@ evaluation:
 item_vec_path: './vectors/item_vectors_kge.npy'
 cate_vec_path: './vectors/cate_vectors.npy'
 
-# option: 'hyper_lora_sasrec'  'mlp' 'sasrec'
-model_type: 'hyper_lora_sasrec'  
+# options: 'dual_tower_sasrec', 'cms_dual_tower'
+model_type: 'dual_tower_sasrec'  
 # Model Hyperparameters
 model:
   batch_size: 4096
@@ -37,6 +37,5 @@ model:
   cate_embed_dim: 64
   lora_r: 64 # LoRA rank for hyper_lora_sasrec
 
-  use_gated_attention: true      # 是否在 Attention 後加入 Gating
-  gating_source: 'token'         # 選項: 'token' (論文做法) 或 'context' (HyperNet做法)
+
 

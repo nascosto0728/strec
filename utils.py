@@ -42,10 +42,14 @@ class RecommendationDataset(Dataset):
         u_history = row['user_interacted_items'] 
         # item_interacted_users: 看過該 item 的 users
         i_history = row['item_interacted_users']
+        # i_history = i_history[:5]  
 
+        # i_history = list(i_history) 
+        # random.shuffle(i_history)
         # 2. Padding
         u_seq_padded = pad_sequences_pure_python([u_history], self.max_seq_len)[0]
         i_seq_padded = pad_sequences_pure_python([i_history], self.max_seq_len)[0]
+        
 
         # 3. 建構回傳字典 (對齊新命名)
         return {

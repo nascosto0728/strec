@@ -71,91 +71,19 @@ def average_pooling(embeddings: torch.Tensor, seq_lens: torch.Tensor) -> torch.T
     else:
         raise ValueError(f"Unsupported embedding dimension: {embeddings.dim()}")
 
-class GatingMechanism(nn.Module):
-    """
-    通用 Gating 模組，支援 Token-dependent 或 Context-dependent
-    """
-    def __init__(self, d_model, context_dim, source='token'):
-        super().__init__()
-        self.source = source
-        self.d_model = d_model
-        
-        # 根據來源決定輸入維度
-        in_dim = d_model if source == 'token' else context_dim
-        
-        # 簡單的投影層生成 Gate (Element-wise)
-        # 論文建議使用 Sigmoid 來獲得稀疏性 (0~1)
-        self.gate_net = nn.Linear(in_dim, d_model)
-        
-        # 初始化：偏置設為正值，讓訓練初期 Gate 接近 1 (全通)，避免梯度消失
-        nn.init.constant_(self.gate_net.bias, 2.0)
-        nn.init.xavier_uniform_(self.gate_net.weight)
+# ===================================================================
+#  標準 Transformer 組件
+# ===================================================================
 
-    def forward(self, x, context=None):
-        """
-        x: [Batch, Seq, Dim] - 當前的 Token Embedding
-        context: [Batch, Context_Dim] - Global Context (如果 source='context')
-        """
-        if self.source == 'token':
-            # Input-Dependent (論文做法): Gate 由 x 自己決定
-            gate_input = x
-        else:
-            # Context-Dependent (HyperNet做法): Gate 由 Context 決定
-            # 需要擴展維度以匹配序列: [B, C_dim] -> [B, 1, C_dim]
-            if context is None:
-                raise ValueError("Context must be provided when gating_source='context'")
-            gate_input = context.unsqueeze(1)
-        
-        # 生成 Gate: [B, S, D] 或 [B, 1, D] (自動廣播)
-        gate = torch.sigmoid(self.gate_net(gate_input))
-        
-        return x * gate
-
-class HyperLoRALinear(nn.Module):
-    """
-    保留原本的 LoRA 架構 (因為實驗證明有效)
-    """
-    def __init__(self, in_features, out_features, r=8, dropout=0.0):
-        super().__init__()
-        self.base = nn.Linear(in_features, out_features)
-        self.lora_down = nn.Linear(in_features, r, bias=False)
-        self.lora_up = nn.Linear(r, out_features, bias=False)
-        self.dropout = nn.Dropout(dropout)
-        
-        nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
-        nn.init.zeros_(self.lora_up.weight)
-        
-    def forward(self, x, context_gate):
-        base_out = self.base(x)
-        
-        # 處理 HyperNet Gate 維度
-        if context_gate.dim() == 2:
-            gate = context_gate.unsqueeze(1)
-        else:
-            gate = context_gate
-            
-        # LoRA 分支
-        down_out = self.lora_down(x)
-        gated_down = down_out * gate # HyperLoRA 的核心
-        lora_out = self.lora_up(gated_down)
-        
-        return base_out + self.dropout(lora_out)
-
-class HyperLoRATransformerLayer(nn.Module):
-    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1, lora_r=8, 
-                 use_gated_attention=False, gating_source='token', context_dim=None):
+class StandardTransformerLayer(nn.Module):
+    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1):
         super().__init__()
         self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
         
-        # [新增] Attention Gating 機制
-        self.use_gated_attention = use_gated_attention
-        if self.use_gated_attention:
-            self.attn_gate = GatingMechanism(d_model, context_dim, source=gating_source)
-        
-        # FFN (保持 HyperLoRA)
-        self.linear1 = HyperLoRALinear(d_model, dim_feedforward, r=lora_r, dropout=dropout)
+        # 標準 FFN: Linear -> Activation -> Dropout -> Linear
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
         self.dropout = nn.Dropout(dropout)
-        self.linear2 = HyperLoRALinear(dim_feedforward, d_model, r=lora_r, dropout=dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
         
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
@@ -163,56 +91,45 @@ class HyperLoRATransformerLayer(nn.Module):
         self.dropout2 = nn.Dropout(dropout)
         self.activation = F.relu
 
-    def forward(self, src, hyper_gate, context_vector=None, src_mask=None, src_key_padding_mask=None):
-        """
-        hyper_gate: 用於控制 LoRA 的 Gate (來自 HyperNet)
-        context_vector: 用於 GatedAttention 的原始 Context (如果 source='context')
-        """
+    def forward(self, src, src_mask=None, src_key_padding_mask=None):
+        # 1. Self-Attention Block (Pre-Norm)
         src2 = self.norm1(src)
         attn_output, _ = self.self_attn(src2, src2, src2, attn_mask=src_mask, key_padding_mask=src_key_padding_mask)
-        
-        # [Gating Injection] Post-Attention Gating (G1)
-        if self.use_gated_attention:
-            attn_output = self.attn_gate(attn_output, context=context_vector)
-            
         src = src + self.dropout1(attn_output)
         
-        # FFN Block (HyperLoRA)
+        # 2. FFN Block (Pre-Norm)
         src2 = self.norm2(src)
-        ffn_out = self.linear1(src2, hyper_gate) 
+        ffn_out = self.linear1(src2)
         ffn_out = self.activation(ffn_out)
         ffn_out = self.dropout(ffn_out)
-        ffn_out = self.linear2(ffn_out, hyper_gate)
+        ffn_out = self.linear2(ffn_out)
         src = src + self.dropout2(ffn_out)
-        return src
         
-class HyperLoRASASRec(nn.Module):
+        return src
+    
+# ===================================================================
+#  主模型: Dual-Tower SASRec
+# ===================================================================
+
+class DualTowerSASRec(nn.Module):
     def __init__(self, global_meta: Dict[str, Any], cfg: Dict[str, Any]):
         super().__init__()
         
         # 1. 配置管理
         self.hparams = cfg['model']
         self.temperature = 0.07 
-        self.maxlen = self.hparams.get('max_seq_len', 30) 
-        self.lora_r = self.hparams.get('lora_r', 16)
+        self.maxlen = self.hparams.get('max_seq_len', 30)
         
-        # [Gating 設定]
-        self.use_gated_attention = self.hparams.get('use_gated_attention', False)
-        self.gating_source = self.hparams.get('gating_source', 'token') # 'token' or 'context'
-        
-        # 2. 註冊 Buffer
+        # 2. 註冊 Buffer (不可訓練的靜態資料)
         self.register_buffer('cates', torch.from_numpy(global_meta['cate_matrix']))
         self.register_buffer('cate_lens', torch.tensor(global_meta['cate_lens'], dtype=torch.int32))
         
-        # 3. Context Dim
-        self.context_dim = self.hparams['item_embed_dim'] # 預設 Context 是 Item Mean
-
-        # 4. 模組構建
+        # 3. 模組構建
         self._build_embeddings()
-        self._build_hyper_components()
         self._build_encoders()
         self._build_prediction_heads()
         
+        # 4. 初始化
         self._init_weights()
 
     def _build_embeddings(self):
@@ -222,56 +139,49 @@ class HyperLoRASASRec(nn.Module):
         self.cate_emb_w = nn.Embedding(self.hparams['n_cates'], self.hparams['cate_embed_dim'])
 
         # Positional Embeddings
+        # Item Tower Input Dim = Item ID + Category
         self.item_seq_input_dim = self.hparams['item_embed_dim'] + self.hparams['cate_embed_dim']
         self.item_seq_pos_emb = nn.Embedding(self.maxlen, self.item_seq_input_dim)
         
+        # User Tower Input Dim = User ID
         self.user_seq_input_dim = self.hparams['user_embed_dim']
         self.user_seq_pos_emb = nn.Embedding(self.maxlen, self.user_seq_input_dim)
+        # self.user_seq_pos_emb.weight.requires_grad = False
 
-        # Buffer for Negatives
+        # Buffer for Negatives (History Lookup)
         history_embed_dim = self.hparams['item_embed_dim']
         self.user_history_buffer = nn.Embedding(self.hparams['n_items'], history_embed_dim)
         self.user_history_buffer.weight.requires_grad = False
 
-    def _build_hyper_components(self):
-        """
-        HyperNetwork 用於生成控制 LoRA 的 Gate
-        """
-        self.hyper_gate_net = nn.Sequential(
-            nn.Linear(self.context_dim, self.lora_r),
-            nn.Tanh(), 
-            nn.Linear(self.lora_r, self.lora_r),
-            nn.Tanh()
-        )
-
-    def _build_transformer_block(self, input_dim: int) -> nn.ModuleList:
-        """
-        構建 Transformer 層，傳入 Gating 設定
-        """
-        return nn.ModuleList([
-            HyperLoRATransformerLayer(
-                d_model=input_dim,
-                nhead=self.hparams.get('transformer_n_heads', 4),
-                dim_feedforward=input_dim * 4,
-                dropout=self.hparams.get('transformer_dropout', 0.1),
-                lora_r=self.lora_r,
-                # Gating Params
-                use_gated_attention=self.use_gated_attention,
-                gating_source=self.gating_source,
-                context_dim=self.context_dim
-            )
-            for _ in range(self.hparams.get('transformer_n_layers', 2))
-        ])
-
     def _build_encoders(self):
-        self.item_seq_transformer_hyper = self._build_transformer_block(self.item_seq_input_dim)
-        self.user_seq_transformer_hyper = self._build_transformer_block(self.user_seq_input_dim)
+        """構建標準 Transformer Encoders"""
+        
+        # Helper: 構建 Stack
+        def _make_stack(input_dim):
+            return nn.ModuleList([
+                StandardTransformerLayer(
+                    d_model=input_dim,
+                    nhead=self.hparams.get('transformer_n_heads', 4),
+                    dim_feedforward=input_dim * 4,
+                    dropout=self.hparams.get('transformer_dropout', 0.1)
+                )
+                for _ in range(self.hparams.get('transformer_n_layers', 2))
+            ])
+
+        # User Tower (處理 Item 序列)
+        self.item_seq_transformer = _make_stack(self.item_seq_input_dim)
+        
+        # Item Tower (處理 User 序列 - CF 訊號)
+        # 這是我們在 Phase 1 會改成 CMS + MeanPool 的部分
+        self.user_seq_transformer = _make_stack(self.user_seq_input_dim)
 
     def _create_mlp(self, input_dim: int) -> nn.Sequential:
+        """標準 MLP Head"""
         expansion_factor = 2
         inner_dim = int(input_dim * expansion_factor)
         dropout = 0.0 
         
+        # PreNorm Residual MLP Block
         class PreNormResidualBlock(nn.Module):
             def __init__(self, dim, fn):
                 super().__init__()
@@ -294,7 +204,11 @@ class HyperLoRASASRec(nn.Module):
         )
 
     def _build_prediction_heads(self):
+        """初始化最後的 Projection Heads"""
+        # Concat Dim = User Static + User Sequence (Item Features)
+        # 注意：這裡假設 Static 和 Sequence 維度拼接邏輯與之前一致
         concat_dim = self.hparams['user_embed_dim'] + self.hparams['item_embed_dim'] + self.hparams['cate_embed_dim']
+        
         self.user_mlp = self._create_mlp(concat_dim)
         self.item_mlp = self._create_mlp(concat_dim)
 
@@ -311,112 +225,121 @@ class HyperLoRASASRec(nn.Module):
         for mlp in [self.user_mlp, self.item_mlp]:
             mlp.apply(_init_mlp)
 
-    # --- Forward Helpers ---
+    # ===================================================================
+    #  Forward 邏輯
+    # ===================================================================
 
     def _lookup_item_features(self, item_ids: torch.Tensor) -> torch.Tensor:
+        """取得 Item Static + Category Features"""
         static_emb = self.item_emb_w(item_ids)
         item_cates = self.cates[item_ids]
         item_cates_emb = self.cate_emb_w(item_cates)
         avg_cate_emb = average_pooling(item_cates_emb, self.cate_lens[item_ids])
         return torch.cat([static_emb, avg_cate_emb], dim=-1)
 
-    def _run_hyper_transformer(self, seq_emb, seq_lens, context_vector, layers_module_list, pos_emb_module):
+    def _run_transformer(self, seq_emb, seq_lens, layers_module_list, pos_emb_module=None, pooling_mode='last') -> torch.Tensor:
         B, T, D = seq_emb.shape
         device = seq_emb.device
-
-        if context_vector.dim() == 1:
-            context_vector = context_vector.unsqueeze(0) # [128] -> [1, 128]
-
-        # 1. 生成控制 LoRA 的 Gate (來自 Context)
-        hyper_gate = self.hyper_gate_net(context_vector).expand(B, -1)
         
-        # 2. Positional Encoding
-        pos_ids = torch.arange(T, dtype=torch.long, device=device)
-        seq_input = seq_emb + pos_emb_module(pos_ids).unsqueeze(0)
+        # 1. Positional Encoding (Conditional)
+        if pos_emb_module is not None:
+            pos_ids = torch.arange(T, dtype=torch.long, device=device)
+            seq_input = seq_emb + pos_emb_module(pos_ids).unsqueeze(0)
+        else:
+            # Set Transformer Mode: No Position Info
+            seq_input = seq_emb
         
-        # 3. Masks
-        causal_mask = nn.Transformer.generate_square_subsequent_mask(T, device=device).bool()
+        # 2. Masks
+        if pos_emb_module is not None:
+            src_mask = nn.Transformer.generate_square_subsequent_mask(T, device=device).bool()
+        else:
+            src_mask = None # Full Attention
         safe_lens = torch.clamp(seq_lens, min=1)
         padding_mask = (torch.arange(T, device=device)[None, :] >= safe_lens[:, None])
         
-        # 4. Layers Forward
+        # 3. Layers Forward
         output = seq_input
         for layer in layers_module_list:
-            output = layer(
-                output, 
-                hyper_gate=hyper_gate,      # 控制 LoRA
-                context_vector=context_vector, # 控制 GatedAttention (如果 source='context')
-                src_mask=causal_mask, 
-                src_key_padding_mask=padding_mask
-            )
+            output = layer(output, src_mask=src_mask, src_key_padding_mask=padding_mask)
             
-        # 5. Pooling (Take last item)
-        target_indices = (seq_lens - 1).clamp(min=0).view(B, 1, 1).expand(-1, 1, D)
-        pooled_output = torch.gather(output, 1, target_indices).squeeze(1)
+        # 4. Pooling Strategy
+        if pooling_mode == 'last':
+            # Sequence Mode: Take last item
+            target_indices = (seq_lens - 1).clamp(min=0).view(B, 1, 1).expand(-1, 1, D)
+            pooled_output = torch.gather(output, 1, target_indices).squeeze(1)
+        elif pooling_mode == 'mean':
+            # Set Mode: Average all valid items
+            # 使用 average_pooling 函式 (記得 import)
+            pooled_output = average_pooling(output, seq_lens)
+        else:
+            raise ValueError(f"Unknown pooling mode: {pooling_mode}")
         
+        # Mask zero length sequences
         mask_zero = (seq_lens == 0).unsqueeze(-1).expand(-1, D)
         pooled_output = pooled_output.masked_fill(mask_zero, 0.0)
         
         return pooled_output
 
     def _build_feature_representations(self, batch: Dict) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        簡化後的特徵構建：移除 EMA 與 Ablation 邏輯，只保留最有效的 Batch Mean
-        """
-        # --- 1. Context Management ---
-        current_items_static = self.item_emb_w(batch['item_id'])
-        batch_context = current_items_static.mean(dim=0)
+        """構建 User 與 Item 的特徵向量"""
         
-        # [重要] 這裡我們統一使用 Batch Context
-        # 因為實驗證明 EMA 沒用，且 Random 會掉分，所以直接用 Batch Mean
-        context_to_use = batch_context
-
-        # --- 2. User Tower ---
+        # --- 1. User Tower ---
+        # Input: User ID + User History (Items)
         user_static = self.user_emb_w(batch['user_id'])
-        hist_item_features = self._lookup_item_features(batch['user_interacted_items'])
-        hist_item_features = hist_item_features.detach()
         
-        user_history_emb = self._run_hyper_transformer(
+        # Lookup history items
+        hist_item_features = self._lookup_item_features(batch['user_interacted_items'])
+        hist_item_features = hist_item_features.detach() # Stop gradient to item emb
+        
+        # Run Transformer
+        user_history_emb = self._run_transformer(
             hist_item_features, 
             batch['user_interacted_len'], 
-            context_to_use, 
-            self.item_seq_transformer_hyper, 
-            self.item_seq_pos_emb
+            self.item_seq_transformer, 
+            self.item_seq_pos_emb,
+            # pos_emb_module=None  # <--- Set Transformer Mode
+            pooling_mode='last'
         )
+        
         user_features = torch.cat([user_static, user_history_emb], dim=-1)
 
-        # --- 3. Item Tower ---
+        # --- 2. Item Tower ---
+        # Input: Item ID/Cate + Item History (Users)
         item_composite_static = self._lookup_item_features(batch['item_id'])
-        item_hist_user_ids = batch['item_interacted_users']
-        item_hist_emb = self.user_emb_w(item_hist_user_ids).detach()
         
-        item_history_emb = self._run_hyper_transformer(
+        item_hist_user_ids = batch['item_interacted_users']
+        item_hist_emb = self.user_emb_w(item_hist_user_ids).detach() # Stop gradient to user emb
+        
+        # Run Transformer
+        item_history_emb = self._run_transformer(
             item_hist_emb, 
             batch['item_interacted_len'], 
-            context_to_use, 
-            self.user_seq_transformer_hyper, 
-            self.user_seq_pos_emb
+            self.user_seq_transformer, 
+            pos_emb_module=self.user_seq_pos_emb,
+            # pos_emb_module=None,  # <--- Set Transformer Mode
+            pooling_mode='last'
         )
+        
         item_features = torch.cat([item_composite_static, item_history_emb], dim=-1)
 
-        # Cache Update
+        # --- Cache Update Mechanism ---
         if self.training:
+            # 將當前 Batch 計算好的 Item History Embedding 存入 Buffer 供推論時的負樣本使用
             self.user_history_buffer.weight[batch['item_id']] = item_history_emb.detach()
-        
 
         return user_features, item_features
-    
-    def _get_embeddings_from_features(self, user_features: torch.Tensor, item_features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        user_embedding = self.user_mlp(user_features) 
-        item_embedding = self.item_mlp(item_features) 
-        user_embedding = F.normalize(user_embedding, p=2, dim=-1)
-        item_embedding = F.normalize(item_embedding, p=2, dim=-1)
 
-        return user_embedding, item_embedding
-    
     def forward(self, batch: Dict) -> Tuple[torch.Tensor, torch.Tensor]:
         user_features, item_features = self._build_feature_representations(batch)
-        user_embedding, item_embedding = self._get_embeddings_from_features(user_features, item_features)
+        
+        # Projection Heads
+        user_embedding = self.user_mlp(user_features)
+        item_embedding = self.item_mlp(item_features)
+        
+        # Normalize
+        user_embedding = F.normalize(user_embedding, p=2, dim=-1)
+        item_embedding = F.normalize(item_embedding, p=2, dim=-1)
+        
         return user_embedding, item_embedding
 
     def _calculate_infonce_loss(self, user_embedding, item_embedding, labels):
@@ -440,16 +363,23 @@ class HyperLoRASASRec(nn.Module):
     def calculate_loss(self, batch: Dict) -> torch.Tensor:
         student_session_emb, student_item_emb = self.forward(batch)
         loss_infonce = self._calculate_infonce_loss(student_session_emb, student_item_emb, batch['labels'])
-        loss_main = loss_infonce.mean()
-        return loss_main
-
+        return loss_infonce.mean()
 
     def inference(self, batch: Dict[str, torch.Tensor], neg_item_ids_batch: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         user_features, item_features = self._build_feature_representations(batch)
-        pos_user_emb, pos_item_emb = self._get_embeddings_from_features(user_features, item_features)
+        pos_user_emb, pos_item_emb = self.forward(batch) # Reuse forward to get normalized embs
+        
+        # 注意: 這裡為了效率，我們直接用 forward 的輸出 (正規化後的)
+        # 上面 forward 內部再跑一次 _build_feature_representations 有點浪費，但在 Inference 時通常沒差
+        # 嚴謹寫法是:
+        # user_features, item_features = self._build_feature_representations(batch)
+        # pos_user_emb = F.normalize(self.user_mlp(user_features), p=2, dim=-1)
+        # pos_item_emb = F.normalize(self.item_mlp(item_features), p=2, dim=-1)
+        
         pos_logits = torch.sum(pos_user_emb * pos_item_emb, dim=1)
         per_sample_loss = F.binary_cross_entropy_with_logits(pos_logits, batch['labels'].float(), reduction='none')
 
+        # Negative Samples Handling
         num_neg_samples = neg_item_ids_batch.shape[1]
         neg_item_static_emb = self.item_emb_w(neg_item_ids_batch) 
         neg_item_cate_emb = self.cate_emb_w(self.cates[neg_item_ids_batch])
@@ -459,8 +389,16 @@ class HyperLoRASASRec(nn.Module):
         
         item_history_emb_expanded = self.user_history_buffer(neg_item_ids_batch)
         neg_item_features = torch.cat([neg_item_emb_with_cate, item_history_emb_expanded.detach()], dim=2)
+        
         user_features_expanded = user_features.unsqueeze(1).expand(-1, num_neg_samples, -1)
-        neg_user_emb_final, neg_item_emb_final = self._get_embeddings_from_features(user_features_expanded, neg_item_features)
+        
+        # MLP Projection for Negatives
+        neg_user_emb = self.user_mlp(user_features_expanded)
+        neg_item_emb = self.item_mlp(neg_item_features)
+        
+        neg_user_emb_final = F.normalize(neg_user_emb, p=2, dim=-1)
+        neg_item_emb_final = F.normalize(neg_item_emb, p=2, dim=-1)
+        
         neg_logits = torch.sum(neg_user_emb_final * neg_item_emb_final, dim=2)
         
         return pos_logits, neg_logits, per_sample_loss

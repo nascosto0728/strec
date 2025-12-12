@@ -12,7 +12,8 @@ import torch
 from torch.utils.data import DataLoader
 
 # 引入重構後的模組
-from model import HyperLoRASASRec
+from model import DualTowerSASRec
+from model_cms import CMSDualTowerSASRec
 
 from utils import (
     prepare_data_pipeline,
@@ -72,8 +73,11 @@ class StreamingTrainer:
         model_type = self.cfg.get('model_type', 'hyper_lora_sasrec')
         print(f"--- Initializing Model: {model_type} ---")
         
-        if model_type == 'hyper_lora_sasrec':
-            model = HyperLoRASASRec(global_meta=self.global_meta, cfg=self.cfg).to(self.device)
+        if model_type == 'dual_tower_sasrec':
+            model = DualTowerSASRec(global_meta=self.global_meta, cfg=self.cfg).to(self.device)
+        elif model_type == 'cms_dual_tower':
+            # Phase 1: User Tower (Transfomer) + Item Tower (CMS + MeanPool)
+            model = CMSDualTowerSASRec(global_meta=self.global_meta, cfg=self.cfg).to(self.device)
         else:
             raise ValueError(f"Unknown model_type: {model_type}")
             
@@ -136,7 +140,7 @@ class StreamingTrainer:
         start_p = self.cfg['train_start_period']
         end_p = self.cfg['num_periods']
         
-        for p_id in range(start_p, end_p):
+        for p_id in range(start_p, end_p-1):
             print(f"\n--- Period {p_id} Start ---")
             
             # 1. 準備當期資料
@@ -220,8 +224,8 @@ class StreamingTrainer:
                 
                 loss.backward()
                 
-                # [CRITICAL] Gradient Clipping to prevent NaN in Transformer/Embedding
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                # # Gradient Clipping to prevent NaN in Transformer/Embedding
+                # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
                 
                 optimizer.step()
                 train_losses.append(loss.item())
@@ -366,13 +370,6 @@ class StreamingTrainer:
         print(f"\n{'='*20} [ Summary for LR {lr} ] {'='*20}")
         df_res = pd.DataFrame(self.results_log)
         mean_res = df_res.mean(numeric_only=True)
-        
-        # print(f"Avg GAUC: {mean_res.get('gauc', 0):.4f}")
-        # for col in mean_res.index:
-        #     if '@' in col:
-        #         print(f"Avg {col}: {mean_res[col]:.4f}")
-        # print("="*60)
-
 
         print(f"  - GAUC     : {mean_res.get('gauc', 0.0):.4f}")
         print(f"  - AUC      : {mean_res.get('auc', 0.0):.4f}")
@@ -398,7 +395,7 @@ if __name__ == "__main__":
         exit(1)
         
     # Set Seed
-    set_seed(config.get('seed', 42))
+    set_seed(config.get('seed', 2354))
     
     # Enforce Deterministic Behavior for Debugging (Optional)
     os.environ['TORCH_USE_CUDA_DSA'] = '1'
