@@ -146,7 +146,6 @@ class DualTowerSASRec(nn.Module):
         # User Tower Input Dim = User ID
         self.user_seq_input_dim = self.hparams['user_embed_dim']
         self.user_seq_pos_emb = nn.Embedding(self.maxlen, self.user_seq_input_dim)
-        # self.user_seq_pos_emb.weight.requires_grad = False
 
         # Buffer for Negatives (History Lookup)
         history_embed_dim = self.hparams['item_embed_dim']
@@ -296,8 +295,8 @@ class DualTowerSASRec(nn.Module):
             hist_item_features, 
             batch['user_interacted_len'], 
             self.item_seq_transformer, 
-            self.item_seq_pos_emb,
-            # pos_emb_module=None  # <--- Set Transformer Mode
+            # self.item_seq_pos_emb,
+            pos_emb_module=None,  # <--- Set Transformer Mode
             pooling_mode='last'
         )
         

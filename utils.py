@@ -187,44 +187,66 @@ def prepare_data_pipeline(config: Dict) -> Tuple[pd.DataFrame, Dict, Dict]:
     return df, global_meta, maps
 
 def sample_negatives_batch(
-    item_pool: Set[int], # 這裡為了相容介面保留，但在高效版中我們主要用 n_items
     pos_item_ids: torch.Tensor,
     pos_user_ids: torch.Tensor,
     user_history_dict: Dict[int, Set[int]],
     n_samples: int,
     device: torch.device,
-    n_items: int # 需要知道物品總數
+    n_items: int,
+    candidate_pool: torch.Tensor = None  # [通用接口] 傳入想要採樣的 ID 集合 Tensor
 ) -> torch.Tensor:
     """
     高效版負採樣：採用拒絕採樣 (Rejection Sampling)
+    
+    參數:
+    - candidate_pool: 如果不是 None，只從這個 Tensor 裡的 ID 進行採樣。
+                      如果是 None，則從 [0, n_items) 範圍採樣。
     """
     batch_size = pos_item_ids.size(0)
     
-    # 1. 先隨機生成 [B, n_samples] 的矩陣
-    # 假設 item id 是從 0 到 n_items-1
-    neg_samples = torch.randint(0, n_items, (batch_size, n_samples), device=device)
+    # --- 1. 決定採樣來源 ---
+    if candidate_pool is not None:
+        # 從指定的 Pool (Active 或 Seen) 中採樣
+        num_candidates = candidate_pool.size(0)
+        # 隨機生成 index [0, num_candidates-1]
+        rand_indices = torch.randint(0, num_candidates, (batch_size, n_samples), device=device)
+        # 映射回真實 item id
+        neg_samples = candidate_pool[rand_indices]
+    else:
+        # 從全域 [0, n_items) 採樣
+        neg_samples = torch.randint(0, n_items, (batch_size, n_samples), device=device)
     
-    # 2. 檢查衝突 (Collision Check)
-    # 這裡我們需要將 history 轉為較好查詢的格式，或者逐個 check
-    # 由於 history 長度不一，完全向量化檢查較難，我們採用 "樂觀採樣 + 修正"
-    
+    # --- 2. 衝突檢查與修正 (拒絕採樣) ---
     pos_item_ids_cpu = pos_item_ids.cpu().numpy()
     pos_user_ids_cpu = pos_user_ids.cpu().numpy()
-    neg_samples_cpu = neg_samples.cpu().numpy() # 轉 numpy 處理比較快
+    neg_samples_cpu = neg_samples.cpu().numpy()
     
+    # 準備 fallback 重抽用的 pool (轉 numpy 以加速單點操作)
+    if candidate_pool is not None:
+        candidate_pool_cpu = candidate_pool.cpu().numpy()
+        num_candidates = len(candidate_pool_cpu)
+    else:
+        candidate_pool_cpu = None
+        num_candidates = n_items
+
     for i in range(batch_size):
         uid = pos_user_ids_cpu[i]
         pos_item = pos_item_ids_cpu[i]
+        # 取得該 User 所有的歷史 (用於過濾 False Negatives)
         seen_set = user_history_dict.get(uid, set())
         
         for j in range(n_samples):
             sampled_item = neg_samples_cpu[i, j]
             
-            # 如果採樣到 (看過的) 或 (當前正樣本)
-            # 進行 Resample (拒絕採樣)
-            # 通常 while 迴圈只會執行 0 或 1 次
+            # 衝突條件：(已看過) OR (等於當前正樣本)
             while sampled_item in seen_set or sampled_item == pos_item:
-                sampled_item = random.randint(0, n_items - 1)
+                # 重新採樣
+                if candidate_pool_cpu is not None:
+                    rand_idx = random.randint(0, num_candidates - 1)
+                    sampled_item = candidate_pool_cpu[rand_idx]
+                else:
+                    sampled_item = random.randint(0, n_items - 1)
+                
                 neg_samples_cpu[i, j] = sampled_item
                 
     return torch.from_numpy(neg_samples_cpu).to(device)

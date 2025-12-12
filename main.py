@@ -148,6 +148,10 @@ class StreamingTrainer:
             if curr_df.empty:
                 print(f"Period {p_id} is empty. Skipping.")
                 continue
+
+            # [新增] 提取當前 Period 的活躍 Item Pool
+            # 這是 Train Set 中出現過的所有 Item
+            self.active_items_list = curr_df['itemId'].unique()
                 
             
             # 2. 繼承權重
@@ -271,6 +275,36 @@ class StreamingTrainer:
         
         Ks = self.cfg['evaluation'].get('Ks', [5, 10, 20])
         n_neg = self.cfg['evaluation'].get('sampling_size', 99)
+
+        # --- 準備採樣池 (Sampling Pool) ---
+        sampling_mode = self.cfg['evaluation'].get('sampling_mode', 'seen') # 預設 global
+        current_pool_tensor = None
+        
+        if sampling_mode == 'active':
+            active_item_pool = torch.tensor(self.active_items_list, dtype=torch.long, device=self.device)
+            # 只用當前 Period 出現過的 Item (已在 run 迴圈中準備好)
+            current_pool_tensor = active_item_pool
+            
+        elif sampling_mode == 'seen':
+            # 用目前為止所有出現過的 Item (History)
+            # self.seen_items_pool 是 set，需轉為 Tensor
+            # 注意：這裡每次轉可能有點慢，但在 evaluate 階段通常還好
+            if self.seen_items_pool:
+                current_pool_tensor = torch.tensor(
+                    list(self.seen_items_pool), 
+                    dtype=torch.long, 
+                    device=self.device
+                )
+            else:
+                # 邊界情況：如果沒有 seen items (剛開始)，退化為 global
+                current_pool_tensor = None
+        
+        elif sampling_mode == 'global':
+            # 0~N，不需要 pool tensor
+            current_pool_tensor = None
+            
+        else:
+            raise ValueError(f"Unknown sampling_mode: {sampling_mode}")
         
         hits = np.zeros(len(Ks))
         ndcgs = np.zeros(len(Ks))
@@ -286,13 +320,13 @@ class StreamingTrainer:
                 # 1. 負採樣
                 #    需要 pos_item_id 和 user_id 來排除已看過的
                 neg_ids = sample_negatives_batch(
-                    self.seen_items_pool,
-                    batch['item_id'],
-                    batch['user_id'],
-                    self.user_history_tracker,
-                    n_neg,
-                    self.device,
-                    n_items=self.global_meta['n_items']
+                    pos_item_ids=batch['item_id'],
+                    pos_user_ids=batch['user_id'],
+                    user_history_dict=self.user_history_tracker, # 始終用於過濾
+                    n_samples=n_neg,
+                    device=self.device,
+                    n_items=self.global_meta['n_items'],
+                    candidate_pool=current_pool_tensor # 決定採樣範圍
                 )
                 
                 # 2. Inference
@@ -348,6 +382,92 @@ class StreamingTrainer:
 
              
         return metrics
+    # def _in_batch_evaluate(self, model, test_loader, target_p_id) -> Dict[str, float]:
+    #     """
+    #     評估 Forward Transfer (使用 In-Batch Negatives)
+    #     這能徹底排除 Buffer 和 Sampling Pool 的潛在偏差
+    #     """
+    #     print(f"--- Evaluating on Period {target_p_id} (In-Batch Negatives) ---")
+    #     model.eval()
+        
+    #     Ks = self.cfg['evaluation'].get('Ks', [5, 10, 20])
+        
+    #     hits = np.zeros(len(Ks))
+    #     ndcgs = np.zeros(len(Ks))
+    #     aucs = []
+    #     n_samples = 0
+        
+    #     with torch.no_grad():
+    #         for batch in tqdm(test_loader, desc="Testing", leave=False):
+    #             batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+    #             B = batch['user_id'].size(0)
+                
+    #             # 如果 Batch 太小 (例如最後一個 batch)，In-Batch 負樣本太少，跳過或特殊處理
+    #             if B < 10: 
+    #                 continue
+                    
+    #             n_samples += B
+                
+    #             # 1. Forward Pass (只算正樣本的 Embedding)
+    #             #    user_emb: [B, D], item_emb: [B, D]
+    #             user_emb, item_emb = model.forward(batch)
+                
+    #             # 2. 計算全矩陣相似度 [B, B]
+    #             #    scores[i, j] = User_i 對 Item_j 的分數
+    #             scores = torch.matmul(user_emb, item_emb.t())
+                
+    #             # 3. 建立標籤與 Mask
+    #             #    對角線是正樣本 (Target)，其他是負樣本
+    #             targets = torch.diag(scores) # [B] - 這是正樣本分數
+                
+    #             # 4. 計算 Metrics
+    #             for i in range(B):
+    #                 pos_score = targets[i]
+    #                 # 取出該 User 對所有 Item 的分數
+    #                 all_scores = scores[i] # [B]
+                    
+    #                 # 排除自己 (正樣本)，比較它與其他 B-1 個負樣本的排名
+    #                 # 邏輯：計算有多少個分數 > pos_score
+    #                 # 嚴格大於 (Strictly Greater)
+    #                 rank = (all_scores > pos_score).sum().item() # 0-based rank
+                    
+    #                 # AUC: (rank 是大於正樣本的負樣本數)
+    #                 # 總負樣本數 = B - 1
+    #                 # AUC = 1 - (rank / (B - 1))
+    #                 auc = 1.0 - (rank / (B - 1))
+    #                 aucs.append(auc)
+                    
+    #                 # Top-K
+    #                 for k_idx, k in enumerate(Ks):
+    #                     if rank < k:
+    #                         hits[k_idx] += 1
+    #                         ndcgs[k_idx] += 1.0 / np.log2(rank + 2)
+
+    #     # Aggregate
+    #     metrics = {
+    #         'period': target_p_id,
+    #         'gauc': np.mean(aucs) if aucs else 0.0,
+    #         'auc': np.mean(aucs) if aucs else 0.0
+    #     }
+    #     for i, k in enumerate(Ks):
+    #         metrics[f'recall@{k}'] = hits[i] / n_samples if n_samples > 0 else 0.0
+    #         metrics[f'ndcg@{k}'] = ndcgs[i] / n_samples if n_samples > 0 else 0.0
+            
+           
+
+    #     print(f"\nPeriod {target_p_id} (Test) Evaluation Finished ---")
+    #     print(f"  - GAUC     : {metrics.get('gauc', 0.0):.4f}")
+    #     print(f"  - AUC      : {metrics.get('auc', 0.0):.4f}")
+    #     print("  -----------------------------------------------------")
+    #     if metrics:
+    #         for k in Ks:
+    #             print(f"  - Recall@{k:<2} : {metrics.get(f'recall@{k}', 0.0):.4f}   |   NDCG@{k:<2} : {metrics.get(f'ndcg@{k}', 0.0):.4f}")
+    #     else:
+    #         print("  - No positive samples for Recall/NDCG in this period.")
+    #     print("  -----------------------------------------------------")
+
+             
+    #     return metrics
 
     def _update_history_tracker(self, df: pd.DataFrame):
         """將當前 DataFrame 的互動紀錄加入全域 History"""
