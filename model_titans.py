@@ -106,12 +106,156 @@ class StandardTransformerLayer(nn.Module):
         src = src + self.dropout2(ffn_out)
         
         return src
+
+class IndependentCMS(nn.Module):
+    """
+    [Phase 1 Core] Independent Continuum Memory System
+    一個持續演化的 MLP，用於捕捉 Item 的 ID/Category 級別的趨勢偏差。
+    不重置，隨時間學習。
+    """
+    def __init__(self, input_dim, hidden_dim, output_dim=None, dropout=0.1):
+        super().__init__()
+        
+        # 如果沒有指定 output_dim，則預設等於 input_dim
+        if output_dim is None:
+            output_dim = input_dim
+            
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(), 
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, output_dim) 
+        )
+        
+        # Zero-Init
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, x):
+        return self.net(x)
+    
+class TitansLayer(nn.Module):
+    """
+    User Tower 專用的 Titans Layer (Linear Memory with Delta Rule)
+    取代原本的 Self-Attention
+    """
+    def __init__(self, d_model, dim_feedforward=2048, dropout=0.1):
+        super().__init__()
+        self.d_model = d_model
+        
+        # 1. Projections for Memory Operations
+        # q, k, v 投影
+        self.proj_q = nn.Linear(d_model, d_model, bias=False)
+        self.proj_k = nn.Linear(d_model, d_model, bias=False)
+        self.proj_v = nn.Linear(d_model, d_model, bias=False)
+        
+        # Gating Projections (Data-dependent decay & learning rate)
+        # 這些控制模型要 "忘記多少" 和 "寫入多少"
+        self.proj_alpha = nn.Linear(d_model, 1) # Forget gate
+        self.proj_eta = nn.Linear(d_model, 1)   # Input gate
+        
+        # 2. Output Projection
+        self.proj_out = nn.Linear(d_model, d_model)
+        
+        # 3. Standard FFN (保持非線性能力)
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.activation = F.relu
+
+    def forward(self, x, src_mask=None, src_key_padding_mask=None):
+        """
+        x: [Batch, Seq, Dim]
+        注意：Titans 是遞歸的，通常不需要 Causal Mask (因為 t 只能看到 t-1)
+        但需要處理 padding mask (即忽略 padding 位置的更新)
+        """
+        B, T, D = x.shape
+        
+        # Pre-Norm
+        x_norm = self.norm1(x)
+        
+        # Projections
+        q = self.proj_q(x_norm) # [B, T, D]
+        k = self.proj_k(x_norm) # [B, T, D]
+        v = self.proj_v(x_norm) # [B, T, D]
+
+        q = F.normalize(q, p=2, dim=-1)
+        k = F.normalize(k, p=2, dim=-1)
+        
+        # Gates: Sigmoid 確保在 [0, 1] 之間
+        alpha = torch.sigmoid(self.proj_alpha(x_norm)) # [B, T, 1]
+        eta = torch.sigmoid(self.proj_eta(x_norm))     # [B, T, 1]
+        
+        # Memory Initialization (S_0 = 0)
+        # State: [B, D, D]
+        state = torch.zeros(B, D, D, device=x.device)
+        
+        outputs = []
+        
+        # Recurrent Loop (Time-step wise)
+        for t in range(T):
+            # 取出當前 step 的變數
+            kt = k[:, t, :].unsqueeze(2) # [B, D, 1]
+            vt = v[:, t, :].unsqueeze(2) # [B, D, 1]
+            qt = q[:, t, :].unsqueeze(1) # [B, 1, D]
+            at = alpha[:, t, :].unsqueeze(2) # [B, 1, 1]
+            et = eta[:, t, :].unsqueeze(2)   # [B, 1, 1]
+            
+            # --- 1. Retrieval (Read) ---
+            # y_t = q_t * S_{t-1}
+            # [B, 1, D] @ [B, D, D] -> [B, 1, D]
+            read_content = torch.bmm(qt, state).squeeze(1) # [B, D]
+            
+            # --- 2. Update (Write) with Delta Rule ---
+            # Pred = S_{t-1} * k_t
+            pred = torch.bmm(state, kt) # [B, D, 1]
+            
+            # Error = v_t - Pred
+            # 自我參照誤差：只有當預測不準時才更新
+            error = vt - pred 
+            
+            # S_t = (1 - alpha) * S_{t-1} + eta * (Error * k_t^T)
+            # 處理 Padding: 如果該位置是 padding，則 alpha=0, eta=0 (不更新)
+            if src_key_padding_mask is not None:
+                # mask is True for padding
+                mask_t = (~src_key_padding_mask[:, t]).float().view(B, 1, 1)
+                at = at * mask_t
+                et = et * mask_t
+                
+            update_term = torch.bmm(error, kt.transpose(1, 2)) # [B, D, D]
+            state = (1 - at) * state + et * update_term
+            
+            outputs.append(read_content)
+            
+        # Stack outputs -> [B, T, D]
+        attn_output = torch.stack(outputs, dim=1)
+        attn_output = self.proj_out(attn_output)
+
+        if torch.isnan(attn_output).any():
+            print("[Warning] Titans produced NaN, replacing with zeros for safety.")
+            attn_output = torch.nan_to_num(attn_output, nan=0.0)
+        
+        # Residual 1
+        x = x + self.dropout1(attn_output)
+        
+        # FFN Block
+        x2 = self.norm2(x)
+        ffn_out = self.linear2(self.dropout(self.activation(self.linear1(x2))))
+        x = x + self.dropout2(ffn_out)
+        
+        return x
     
 # ===================================================================
 #  主模型: Dual-Tower SASRec
 # ===================================================================
 
-class DualTowerSASRec(nn.Module):
+class TitansDualTowerSASRec(nn.Module):
     def __init__(self, global_meta: Dict[str, Any], cfg: Dict[str, Any]):
         super().__init__()
         
@@ -127,6 +271,7 @@ class DualTowerSASRec(nn.Module):
         # 3. 模組構建
         self._build_embeddings()
         self._build_encoders()
+        self._build_adaptive_modules() # [新增] 構建 CMS 等適應性模組
         self._build_prediction_heads()
         
         # 4. 初始化
@@ -153,10 +298,8 @@ class DualTowerSASRec(nn.Module):
         self.user_history_buffer.weight.requires_grad = False
 
     def _build_encoders(self):
-        """構建標準 Transformer Encoders"""
-        
-        # Helper: 構建 Stack
-        def _make_stack(input_dim):
+        # Helper for Transformer Stack
+        def _make_transformer_stack(input_dim):
             return nn.ModuleList([
                 StandardTransformerLayer(
                     d_model=input_dim,
@@ -166,13 +309,48 @@ class DualTowerSASRec(nn.Module):
                 )
                 for _ in range(self.hparams.get('transformer_n_layers', 2))
             ])
+            
+        # Helper for Titans Stack
+        def _make_titans_stack(input_dim):
+            return nn.ModuleList([
+                TitansLayer(
+                    d_model=input_dim,
+                    dim_feedforward=input_dim * 4,
+                    dropout=self.hparams.get('transformer_dropout', 0.1)
+                )
+                for _ in range(self.hparams.get('transformer_n_layers', 2))
+            ])
 
-        # User Tower (處理 Item 序列)
-        self.item_seq_transformer = _make_stack(self.item_seq_input_dim)
+        # --- User Tower ---
+        # [Phase 2] 切換開關
+        if self.hparams.get('user_tower_type', 'titans') == 'titans':
+            print("--- [Model] User Tower using Self-Referential Titans ---")
+            self.item_seq_transformer = _make_titans_stack(self.item_seq_input_dim)
+        else:
+            self.item_seq_transformer = _make_transformer_stack(self.user_seq_input_dim)
         
-        # Item Tower (處理 User 序列 - CF 訊號)
-        # 這是我們在 Phase 1 會改成 CMS + MeanPool 的部分
-        self.user_seq_transformer = _make_stack(self.user_seq_input_dim)
+        # --- Item Tower ---
+        # 保持 Transformer (因為 Phase 1 證明它最穩)
+        self.user_seq_transformer = _make_transformer_stack(self.user_seq_input_dim)
+
+    def _build_adaptive_modules(self):
+        """[Phase 1] 構建適應性模組 (CMS)"""
+        self.use_cms = self.hparams.get('use_cms', False)
+        
+        if self.use_cms:
+            # CMS 輸入: Item Static (ID + Cate) -> 192
+            self.cms_input_dim = self.item_seq_input_dim
+            
+            # CMS 輸出: 必須對齊 Item History (User Emb) -> 128
+            self.cms_output_dim = self.user_seq_input_dim 
+            
+            self.cms_module = IndependentCMS(
+                input_dim=self.cms_input_dim,
+                hidden_dim=self.cms_input_dim * 2,
+                output_dim=self.cms_output_dim # [修正] 指定輸出維度
+            )
+        else:
+            self.cms_module = None
 
     def _create_mlp(self, input_dim: int) -> nn.Sequential:
         """標準 MLP Head"""
@@ -240,40 +418,41 @@ class DualTowerSASRec(nn.Module):
         B, T, D = seq_emb.shape
         device = seq_emb.device
         
-        # 1. Positional Encoding (Conditional)
+        # 1. Positional Encoding
         if pos_emb_module is not None:
             pos_ids = torch.arange(T, dtype=torch.long, device=device)
             seq_input = seq_emb + pos_emb_module(pos_ids).unsqueeze(0)
         else:
-            # Set Transformer Mode: No Position Info
             seq_input = seq_emb
         
         # 2. Masks
-        if pos_emb_module is not None:
+        # 如果是 TitansLayer，它不需要 Causal Mask (src_mask)，只需要 Padding Mask
+        is_titans = isinstance(layers_module_list[0], TitansLayer)
+        
+        if not is_titans and pos_emb_module is not None:
             src_mask = nn.Transformer.generate_square_subsequent_mask(T, device=device).bool()
         else:
-            src_mask = None # Full Attention
+            src_mask = None 
+
         safe_lens = torch.clamp(seq_lens, min=1)
         padding_mask = (torch.arange(T, device=device)[None, :] >= safe_lens[:, None])
         
         # 3. Layers Forward
         output = seq_input
         for layer in layers_module_list:
-            output = layer(output, src_mask=src_mask, src_key_padding_mask=padding_mask)
+            if is_titans:
+                # Titans 介面稍有不同，只傳需要的
+                output = layer(output, src_key_padding_mask=padding_mask)
+            else:
+                output = layer(output, src_mask=src_mask, src_key_padding_mask=padding_mask)
             
-        # 4. Pooling Strategy
+        # 4. Pooling Strategy (保持不變)
         if pooling_mode == 'last':
-            # Sequence Mode: Take last item
             target_indices = (seq_lens - 1).clamp(min=0).view(B, 1, 1).expand(-1, 1, D)
             pooled_output = torch.gather(output, 1, target_indices).squeeze(1)
         elif pooling_mode == 'mean':
-            # Set Mode: Average all valid items
-            # 使用 average_pooling 函式 (記得 import)
             pooled_output = average_pooling(output, seq_lens)
-        else:
-            raise ValueError(f"Unknown pooling mode: {pooling_mode}")
         
-        # Mask zero length sequences
         mask_zero = (seq_lens == 0).unsqueeze(-1).expand(-1, D)
         pooled_output = pooled_output.masked_fill(mask_zero, 0.0)
         
@@ -318,6 +497,13 @@ class DualTowerSASRec(nn.Module):
             # pos_emb_module=None,  # <--- Set Transformer Mode
             pooling_mode='last'
         )
+        
+        # [Phase 1: CMS Trend Injection]
+        if self.use_cms:
+            # CMS 根據靜態 ID/Cate 預測趨勢偏差
+            trend_bias = self.cms_module(item_composite_static)
+            # Additive Injection: Item Embedding = CF_Agg + Trend
+            item_history_emb = item_history_emb + trend_bias
         
         item_features = torch.cat([item_composite_static, item_history_emb], dim=-1)
 

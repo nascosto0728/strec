@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 
 # 引入重構後的模組
 from model import DualTowerSASRec
-from model_cms import CMSDualTowerSASRec
+from model_titans import TitansDualTowerSASRec
 
 from utils import (
     prepare_data_pipeline,
@@ -75,9 +75,8 @@ class StreamingTrainer:
         
         if model_type == 'dual_tower_sasrec':
             model = DualTowerSASRec(global_meta=self.global_meta, cfg=self.cfg).to(self.device)
-        elif model_type == 'cms_dual_tower':
-            # Phase 1: User Tower (Transfomer) + Item Tower (CMS + MeanPool)
-            model = CMSDualTowerSASRec(global_meta=self.global_meta, cfg=self.cfg).to(self.device)
+        elif model_type == 'titans_dual_tower':
+            model = TitansDualTowerSASRec(global_meta=self.global_meta, cfg=self.cfg).to(self.device)
         else:
             raise ValueError(f"Unknown model_type: {model_type}")
             

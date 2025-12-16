@@ -25,17 +25,18 @@ evaluation:
 item_vec_path: './vectors/item_vectors_kge.npy'
 cate_vec_path: './vectors/cate_vectors.npy'
 
-# options: 'dual_tower_sasrec', 'cms_dual_tower'
-model_type: 'dual_tower_sasrec'  
+# options: 'dual_tower_sasrec', 'titans_dual_tower'
+model_type: 'titans_dual_tower'  
 # Model Hyperparameters
 model:
-  batch_size: 4096
+  batch_size: 1024
   text_embed_dim: 384
-  user_embed_dim: 128
-  item_embed_dim: 128
-  output_dim: 128
-  cate_embed_dim: 64
-  lora_r: 64 # LoRA rank for hyper_lora_sasrec
+  user_embed_dim: 32
+  item_embed_dim: 32
+  output_dim: 32
+  cate_embed_dim: 16
+
+  use_cms: true  # 是否啟用 CMS 模組
 
 
 
