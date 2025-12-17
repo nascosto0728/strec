@@ -45,12 +45,9 @@ def _debug_check(name: str, x, verbose: bool = False, raise_on_error: bool = Fal
 # ===================================================================
 #  Core Component 1: User Memory Bank (CPU Offload)
 # ===================================================================
-
 class UserMemoryBank:
     """
     全域使用者記憶體庫 (Global User Memory Bank)
-    - 儲存所有 User 的 Titans 狀態矩陣 S (Size: N_users * D * D)
-    - 存放在 CPU RAM 以避免 GPU OOM
     支援 enable_cpu_offload 選項
     - True: 儲存在 CPU (節省顯存，適合大維度)
     - False: 儲存在 GPU (速度最快，適合小維度)
@@ -62,7 +59,12 @@ class UserMemoryBank:
         
         # 計算記憶體大小
         mem_size_gb = (n_users * d_model * d_model * 4) / (1024**3)
-        location = "CPU" if enable_cpu_offload else f"GPU (device={torch.cuda.current_device()})"
+        location = "CPU" if enable_cpu_offload else "GPU"
+        
+        # 安全檢查 device
+        if not enable_cpu_offload and torch.cuda.is_available():
+             location += f" (device={torch.cuda.current_device()})"
+        
         print(f"--- [MemoryBank] Allocating {n_users}x{d_model}x{d_model} state matrix on {location} ---")
         print(f"--- [MemoryBank] Estimated Size: {mem_size_gb:.2f} GB ---")
         
@@ -71,10 +73,11 @@ class UserMemoryBank:
             self.states = torch.zeros(n_users, d_model, d_model, dtype=torch.float32, pin_memory=True)
         else:
             # GPU Mode: 直接在 GPU 上分配
-            self.states = torch.zeros(n_users, d_model, d_model, dtype=torch.float32, device=torch.device("cuda"))
+            device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+            self.states = torch.zeros(n_users, d_model, d_model, dtype=torch.float32, device=device)
         
     def get_batch_states(self, user_ids: torch.Tensor, target_device: torch.device = None) -> torch.Tensor:
-        """讀取舊狀態"""
+        """讀取舊狀態 (Detached from history because it's from storage)"""
         # index_select 的 index 必須與 tensor 在同一設備
         if self.enable_cpu_offload:
             # CPU -> GPU
@@ -82,12 +85,12 @@ class UserMemoryBank:
             batch_states = self.states.index_select(0, ids_cpu)
             return batch_states.to(target_device, non_blocking=True)
         else:
-            # GPU -> GPU (Zero Copy, Ultra Fast)
+            # GPU -> GPU (Zero Copy)
             return self.states.index_select(0, user_ids)
     
     def update_batch_states(self, user_ids: torch.Tensor, new_states: torch.Tensor):
         """寫入新狀態"""
-        # Detach 截斷梯度流
+        # Detach 截斷梯度流，避免顯存洩漏
         new_states_detached = new_states.detach()
         
         if self.enable_cpu_offload:
@@ -281,7 +284,6 @@ class DualTowerTitans(nn.Module):
         self._build_embeddings()
         
         # 2. Titans Memory Bank 
-        # [Update] 讀取 Config 決定是否開啟 CPU Offload
         enable_cpu_offload = self.hparams.get('titans_cpu_offload', False)
         self.user_memory_bank = UserMemoryBank(
             n_users=self.hparams['n_users'], 
@@ -293,8 +295,8 @@ class DualTowerTitans(nn.Module):
         self._build_encoders()
         
         # 4. Heads
-        self.user_mlp = self._create_mlp(self.user_emb_dim * 2) # Static + Dynamic
-        self.item_mlp = self._create_mlp(self.item_emb_dim * 2) # Static + History
+        self.user_mlp = self._create_mlp(self.user_emb_dim * 2) # Static + Dynamic -> 2x
+        self.item_mlp = self._create_mlp(self.item_emb_dim * 2) # Static + History -> 2x
 
         # 5. Negatives Buffer
         self.user_history_buffer = nn.Embedding(self.hparams['n_items'], self.item_emb_dim)
@@ -303,19 +305,24 @@ class DualTowerTitans(nn.Module):
         self._init_weights()
 
     def _build_embeddings(self):
-        self.user_emb_w = nn.Embedding(self.hparams['n_users'], self.user_emb_dim)
-        self.item_emb_w = nn.Embedding(self.hparams['n_items'], self.item_emb_dim)
-        self.cate_emb_w = nn.Embedding(self.hparams['n_cates'], self.cate_emb_dim)
+        self.user_emb_w = nn.Embedding(self.hparams['n_users'], self.user_emb_dim, padding_idx=0)
+        self.item_emb_w = nn.Embedding(self.hparams['n_items'], self.item_emb_dim, padding_idx=0) 
+        self.cate_emb_w = nn.Embedding(self.hparams['n_cates'], self.cate_emb_dim, padding_idx=0)
 
         # Positional Embedding (只給 Item Tower 的 Transformer 用)
         self.item_tower_pos_emb = nn.Embedding(self.maxlen, self.item_tower_input_dim)
 
+        # [新增] Learnable BOS Token (Beginning of Sequence)
+        # 當 User 沒有任何歷史 (interacted_len == 0) 時，用這個向量來更新初始狀態
+        self.bos_item_emb = nn.Parameter(torch.randn(1, self.item_emb_dim))
+    
+        # 初始化權重
+        nn.init.normal_(self.bos_item_emb, mean=0, std=0.02)
+
     def _build_encoders(self):
-        # --- User Tower: Titans (Single Layer for State Update) ---
-        # 為了狀態管理簡單，這裡使用單層 Titans 進行 Memory Update
-        # 如果需要更深網路，可以在 Titans 後面接 MLP
+        # --- User Tower: One Step Titans ---
         self.user_titans = TitansLayer(
-            d_model=self.user_tower_input_dim, # 192
+            d_model=self.user_tower_input_dim,
             dim_feedforward=self.user_tower_input_dim * 4,
             dropout=self.hparams.get('transformer_dropout', 0.1)
         )
@@ -323,7 +330,7 @@ class DualTowerTitans(nn.Module):
         # --- Item Tower: Transformer (Standard SASRec) ---
         self.item_transformer = nn.ModuleList([
             StandardTransformerLayer(
-                d_model=self.item_tower_input_dim, # 128
+                d_model=self.item_tower_input_dim, 
                 nhead=4,
                 dim_feedforward=self.item_tower_input_dim * 4,
                 dropout=0.1
@@ -335,7 +342,7 @@ class DualTowerTitans(nn.Module):
             nn.LayerNorm(input_dim),
             nn.Linear(input_dim, input_dim * 2),
             nn.ReLU(),
-            nn.Linear(input_dim * 2, input_dim)
+            nn.Linear(input_dim * 2, input_dim) 
         )
 
     def _init_weights(self):
@@ -359,8 +366,7 @@ class DualTowerTitans(nn.Module):
         item_cates_emb = self.cate_emb_w(item_cates)
         avg_cate_emb = average_pooling(item_cates_emb, self.cate_lens[item_ids]) # [B, D]
         
-        # [修改] 改為相加 (Additive)
-        # 這樣維度保持為 D，不會變成 D + D_cate
+        # 相加模式 (Additive)
         return static_emb + avg_cate_emb
 
     def _build_feature_representations(self, batch: Dict) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -368,42 +374,55 @@ class DualTowerTitans(nn.Module):
         # ---------------------------------------------------
         # 1. User Tower (Titans - Stateful)
         # ---------------------------------------------------
-        # --- 1. User Tower (Stateful Streaming) ---
-        user_static = self.user_emb_w(batch['user_id'])
+        user_static = self.user_emb_w(batch['user_id']) # [B, D]
         
-        # 從 Memory Bank 讀取 "更新前" 的狀態
-        old_state = self.user_memory_bank.get_batch_states(batch['user_id'], user_static.device)
+        # A. 從 Memory Bank 讀取 Old State (Detached)
+        state_before_prev = self.user_memory_bank.get_batch_states(batch['user_id'], user_static.device)
         
-        # [Phase A: Predict] 
-        # 使用 User Static + Old State 產生 User Feature
-        # 這裡完全沒用到 current item，所以絕對沒有 Leakage
-        titans_out = self.user_titans.predict(user_static, old_state)
+        # B. [動態提取] 準備 Prev Item Features (用於更新狀態)
+        # 1. 取得歷史序列與長度
+        hist_seq = batch['user_interacted_items'] # [B, MaxLen]
+        hist_len = batch['user_interacted_len']   # [B]
+        B = hist_len.size(0)
+
+        # 2. 計算最後一個有效 Item 的 Index (Clamp to 0 to avoid error, masked later)
+        last_item_idx = (hist_len - 1).clamp(min=0).unsqueeze(1)
         
-        # 這裡可以選擇 concat(static, dynamic) 或者直接用 dynamic
-        # 假設我們 concat 以保留最強的 ID 訊號
+        # 3. Gather Prev Item ID
+        prev_item_ids = hist_seq.gather(1, last_item_idx).squeeze(1)
+        
+        # 4. Lookup Features (No Detach! We want gradient to flow here)
+        prev_item_features = self._lookup_item_features(prev_item_ids) # [B, D]
+        
+        # 5. Cold Start Mask (Len == 0) -> Use BOS
+        is_cold_start = (hist_len == 0).unsqueeze(1) # [B, 1]
+        bos_expanded = self.bos_item_emb.expand(B, -1)
+        
+        # 混合 Input: 冷啟動用 BOS，否則用上一個 Item
+        update_input_emb = torch.where(is_cold_start, bos_expanded, prev_item_features)
+        
+        # C. [Update Step] 用 Prev Item / BOS 更新狀態，得到 Current State (With Grad)
+        current_state = self.user_titans.update(update_input_emb, state_before_prev)
+        
+        # D. [Predict Step] 使用 Current State 預測 User Feature
+        titans_out = self.user_titans.predict(user_static, current_state)
+        
+        # Concat [B, 2D]
         user_features = torch.cat([user_static, titans_out], dim=-1)
 
-        # [Phase B: Update Preparation]
-        # 準備好要用來更新的新狀態，但不參與這裡的 User Embedding 計算
-        # 我們使用當前互動的 Item 來更新 User 的記憶
-        current_item_features = self._lookup_item_features(batch['item_id']).detach()
-        new_state = self.user_titans.update(current_item_features, old_state)
-
-        # [State Update] 只在訓練時更新 Memory Bank
+        # [State Update] 只在訓練時更新 Memory Bank (Inference 時不更新，避免污染)
         if self.training:
-            self.user_memory_bank.update_batch_states(batch['user_id'], new_state)
+            self.user_memory_bank.update_batch_states(batch['user_id'], current_state)
             
-
         # ---------------------------------------------------
         # 2. Item Tower (Transformer - Stateless)
         # ---------------------------------------------------
-        item_composite_static = self._lookup_item_features(batch['item_id'])
-        B, _ = item_composite_static.shape
-
+        item_composite_static = self._lookup_item_features(batch['item_id']) # [B, D]
+        B_item, _ = item_composite_static.shape
         
-        # Input: User Sequence
+        # Input: Item Sequence
         item_hist_user_ids = batch['item_interacted_users']
-        item_hist_emb = self.user_emb_w(item_hist_user_ids).detach()
+        item_hist_emb = self.user_emb_w(item_hist_user_ids).detach() # [B, T, D]
         seq_len_i = batch['item_interacted_len']
         
         # Add Positional Embedding
@@ -421,7 +440,7 @@ class DualTowerTitans(nn.Module):
             output = layer(output, src_mask=src_mask, src_key_padding_mask=padding_mask_i)
             
         # Pooling (Last)
-        target_indices_i = (seq_len_i - 1).clamp(min=0).view(B, 1, 1).expand(-1, 1, self.item_tower_input_dim)
+        target_indices_i = (seq_len_i - 1).clamp(min=0).view(B_item, 1, 1).expand(-1, 1, self.item_tower_input_dim)
         item_history_emb = torch.gather(output, 1, target_indices_i).squeeze(1)
         
         # Update Negatives Buffer
@@ -464,32 +483,44 @@ class DualTowerTitans(nn.Module):
         return loss_infonce.mean()
 
     def inference(self, batch: Dict[str, torch.Tensor], neg_item_ids_batch: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # 1. 取得 User Features (training=False, 不會更新 Memory)
         user_features, item_features = self._build_feature_representations(batch)
+        
+        # 2. Positive Scores
         pos_user_emb = F.normalize(self.user_mlp(user_features), p=2, dim=-1)
         pos_item_emb = F.normalize(self.item_mlp(item_features), p=2, dim=-1)
         
         pos_logits = torch.sum(pos_user_emb * pos_item_emb, dim=1)
         per_sample_loss = F.binary_cross_entropy_with_logits(pos_logits, batch['labels'].float(), reduction='none')
 
-        # Negative Samples Handling
+        # 3. Negative Samples Handling
         num_neg_samples = neg_item_ids_batch.shape[1]
+        
+        # A. 負樣本 Static (ID + Cate)
         neg_item_static_emb = self.item_emb_w(neg_item_ids_batch) 
         neg_item_cate_emb = self.cate_emb_w(self.cates[neg_item_ids_batch])
         neg_item_cates_len = self.cate_lens[neg_item_ids_batch]
         avg_cate_emb_for_neg_item = average_pooling(neg_item_cate_emb, neg_item_cates_len) 
-        neg_item_emb_with_cate = neg_item_static_emb + avg_cate_emb_for_neg_item # [B, Neg, D]
         
+        # 相加模式 (Additive)
+        neg_item_emb_with_cate = neg_item_static_emb + avg_cate_emb_for_neg_item 
+        
+        # B. 負樣本 History (從 Buffer 讀取)
         item_history_emb_expanded = self.user_history_buffer(neg_item_ids_batch)
+        
+        # C. 組合 (Concat)
         neg_item_features = torch.cat([neg_item_emb_with_cate, item_history_emb_expanded.detach()], dim=2)
         
+        # D. User Feature 擴展
         user_features_expanded = user_features.unsqueeze(1).expand(-1, num_neg_samples, -1)
         
-        # MLP Projection for Negatives
+        # E. MLP Projection
         neg_user_emb = self.user_mlp(user_features_expanded)
         neg_item_emb = self.item_mlp(neg_item_features)
         
-        neg_user_emb_final = F.normalize(neg_user_emb, p=2, dim=-1)
-        neg_item_emb_final = F.normalize(neg_item_emb, p=2, dim=-1)
+        # [修正] 補上 eps=1e-6
+        neg_user_emb_final = F.normalize(neg_user_emb, p=2, dim=-1, eps=1e-6)
+        neg_item_emb_final = F.normalize(neg_item_emb, p=2, dim=-1, eps=1e-6)
         
         neg_logits = torch.sum(neg_user_emb_final * neg_item_emb_final, dim=2)
         

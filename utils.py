@@ -79,14 +79,16 @@ def process_category_data(meta_df: pd.DataFrame, item_map: Dict, max_cate_len: i
     all_cates = set()
     for c_list in meta_df['cateId']:
         all_cates.update(c_list)
-    
-    cate_map = {c: i for i, c in enumerate(sorted(list(all_cates)))}
-    n_cates = len(cate_map)
+
+    cate_map = {c: i for i, c in enumerate(sorted(list(all_cates)), 1)}
+    n_cates = len(cate_map) + 1 # 含 padding
     
     # 建立 item -> cate_indices 矩陣
-    n_items = len(item_map)
-    cate_matrix = np.zeros((n_items, max_cate_len), dtype=np.int32)
-    cate_lens = np.zeros(n_items, dtype=np.int32)
+    n_items_with_pad = len(item_map) + 1 # 這是 prepare_data_pipeline 傳進來的 map 長度 + 1
+    # 分配矩陣：大小為 [Max_Item_ID + 1, Max_Cate_Len]
+    # 預設值 0 即為 Padding
+    cate_matrix = np.zeros((n_items_with_pad, max_cate_len), dtype=np.int32)
+    cate_lens = np.zeros(n_items_with_pad, dtype=np.int32)
     
     # 建立查詢表以加速
     item_to_cates = dict(zip(meta_df['itemId'], meta_df['cateId']))
@@ -95,10 +97,11 @@ def process_category_data(meta_df: pd.DataFrame, item_map: Dict, max_cate_len: i
     # 反轉 item_map: internal_id -> raw_id
     id_to_raw = {v: k for k, v in item_map.items()}
     
-    for internal_id in range(n_items):
+    for internal_id in range(1, n_items_with_pad):
         raw_id = id_to_raw.get(internal_id)
         if raw_id in item_to_cates:
             raw_cates = item_to_cates[raw_id]
+            # 轉換為 shifted cate id
             mapped_cates = [cate_map[c] for c in raw_cates if c in cate_map][:max_cate_len]
             cate_matrix[internal_id, :len(mapped_cates)] = mapped_cates
             cate_lens[internal_id] = len(mapped_cates)
@@ -120,6 +123,9 @@ def prepare_data_pipeline(config: Dict) -> Tuple[pd.DataFrame, Dict, Dict]:
     if config.get('debug_sample', 0) > 0:
         df = df.iloc[::config['debug_sample']]
         print(f"--- [DEBUG] Sampling enabled. Rows: {len(df)}")
+    df = df[(config['train_start_period'] <= df['period']) &
+            (df['period'] < config['train_start_period'] + config['num_periods'])
+            ]
 
     # 1. 基礎清洗 (字串 -> List)
     print("--- [Data] Parsing Sequences ---")
@@ -137,12 +143,12 @@ def prepare_data_pipeline(config: Dict) -> Tuple[pd.DataFrame, Dict, Dict]:
     all_items = set(df['itemId'].unique())
     for seq in df['user_interacted_items']: all_items.update(seq)
     
-    user_map = {u: i for i, u in enumerate(sorted(list(all_users)))}
-    item_map = {i: k for k, i in enumerate(sorted(list(all_items)))}
+    user_map = {u: i for i, u in enumerate(sorted(list(all_users)), 1)}
+    item_map = {i: k for k, i in enumerate(sorted(list(all_items)), 1)}
     
-    n_users = len(user_map)
-    n_items = len(item_map)
-    print(f"    Total Users: {n_users}, Total Items: {n_items}")
+    n_users = len(user_map) + 1
+    n_items = len(item_map) + 1
+    print(f"    Total Users: {n_users-1}, Total Items: {n_items-1}")
     
     # 3. Remap DataFrame
     print("--- [Data] Remapping IDs ---")

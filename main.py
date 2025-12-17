@@ -60,6 +60,33 @@ class StreamingTrainer:
         # 3. 實驗結果容器
         self.results_log = []
 
+
+        print("--- [Self-Check] Verifying ID Shifts ---")
+        min_user = self.full_df['userId'].min()
+        min_item = self.full_df['itemId'].min()
+        max_item = self.full_df['itemId'].max()
+        n_items_conf = self.global_meta['n_items']
+
+        print(f"Min User ID: {min_user}")
+        print(f"Min Item ID: {min_item}")
+        print(f"Max Item ID: {max_item}")
+        print(f"Config n_items: {n_items_conf-1}")
+
+        # 驗證 1: 最小 ID 必須是 1 (不包含 0)
+        assert min_user >= 1, "Error: User ID contains 0!"
+        assert min_item >= 1, "Error: Item ID contains 0!"
+
+        # 驗證 2: Config 的大小必須包得住 Max ID
+        assert n_items_conf > max_item, f"Error: n_items ({n_items_conf}) <= max_item ({max_item})"
+
+        # 驗證 3: 檢查序列中是否有 0 (除了 padding 以外不該有)
+        # 這裡抽樣檢查一下
+        sample_seq = self.full_df['user_interacted_items'].iloc[0]
+        if len(sample_seq) > 0:
+            assert min(sample_seq) >= 1, "Error: Sequence contains 0!"
+
+        print("--- [Self-Check] Passed! IDs are correctly shifted. ---")
+
     def _get_device(self) -> torch.device:
         if torch.cuda.is_available():
             print("--- Device: CUDA ---")
