@@ -1,5 +1,5 @@
 # Data paths
-data_path: './datasets/record_movielens_paper.parquet'
+data_path: './datasets/record_movielens.parquet'
 meta_path: './datasets/content_movielens.parquet'
 
 # Experiment settings
@@ -16,7 +16,7 @@ max_epochs: 10         # 每個 period 最多跑 100 個 epoch
 validation_split: 0.2   # 從「當前 period」切 20% 出來當驗證集
 patience: 1            # 驗證集損失 (val_loss) 連續 10 次沒進步就停止
 
-debug_sample: 10000
+debug_sample: 0
 
 evaluation:
   sampling_size: 99
@@ -25,8 +25,8 @@ evaluation:
 item_vec_path: './vectors/item_vectors_kge.npy'
 cate_vec_path: './vectors/cate_vectors.npy'
 
-# options: 'dual_tower_sasrec', 'titans_dual_tower'
-model_type: 'titans_dual_tower'  
+# options: 'dual_tower_sasrec', 'dual_tower_titans'
+model_type: 'dual_tower_titans'  
 # Model Hyperparameters
 model:
   batch_size: 1024
@@ -36,7 +36,7 @@ model:
   output_dim: 32
   cate_embed_dim: 16
 
-  use_cms: true  # 是否啟用 CMS 模組
+  titans_cpu_offload: false  # Titans CPU Offload 選項
 
 
 

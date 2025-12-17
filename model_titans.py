@@ -43,48 +43,176 @@ def _debug_check(name: str, x, verbose: bool = False, raise_on_error: bool = Fal
             print(f"[DEBUG] {name}: ok (shape={tuple(x.shape)}, dtype={x.dtype}, device={x.device})")
 
 # ===================================================================
-# 輔助函式 
+#  Core Component 1: User Memory Bank (CPU Offload)
 # ===================================================================
-    
-def average_pooling(embeddings: torch.Tensor, seq_lens: torch.Tensor) -> torch.Tensor:
+
+class UserMemoryBank:
     """
-    對 Embedding 進行帶遮罩的平均池化。
+    全域使用者記憶體庫 (Global User Memory Bank)
+    - 儲存所有 User 的 Titans 狀態矩陣 S (Size: N_users * D * D)
+    - 存放在 CPU RAM 以避免 GPU OOM
+    支援 enable_cpu_offload 選項
+    - True: 儲存在 CPU (節省顯存，適合大維度)
+    - False: 儲存在 GPU (速度最快，適合小維度)
     """
-    if embeddings.dim() == 4: 
-        max_len = embeddings.size(2)
-        mask = torch.arange(max_len, device=embeddings.device)[None, None, :] < seq_lens.unsqueeze(-1)
-        mask = mask.float().unsqueeze(-1) 
+    def __init__(self, n_users: int, d_model: int,  enable_cpu_offload: bool = False):
+        self.n_users = n_users
+        self.d_model = d_model
+        self.enable_cpu_offload = enable_cpu_offload
         
-        masked_sum = torch.sum(embeddings * mask, dim=2)
-        count = mask.sum(dim=2) + 1e-9
-        return masked_sum / count
-    
-    elif embeddings.dim() == 3: 
-        max_len = embeddings.size(1)
-        mask = torch.arange(max_len, device=embeddings.device)[None, :] < seq_lens[:, None]
-        mask = mask.float().unsqueeze(-1) 
+        # 計算記憶體大小
+        mem_size_gb = (n_users * d_model * d_model * 4) / (1024**3)
+        location = "CPU" if enable_cpu_offload else f"GPU (device={torch.cuda.current_device()})"
+        print(f"--- [MemoryBank] Allocating {n_users}x{d_model}x{d_model} state matrix on {location} ---")
+        print(f"--- [MemoryBank] Estimated Size: {mem_size_gb:.2f} GB ---")
         
-        masked_sum = torch.sum(embeddings * mask, dim=1)
-        count = mask.sum(dim=1) + 1e-9
-        return masked_sum / count
+        if enable_cpu_offload:
+            # CPU Mode: 使用 pin_memory 加速傳輸
+            self.states = torch.zeros(n_users, d_model, d_model, dtype=torch.float32, pin_memory=True)
+        else:
+            # GPU Mode: 直接在 GPU 上分配
+            self.states = torch.zeros(n_users, d_model, d_model, dtype=torch.float32, device=torch.device("cuda"))
+        
+    def get_batch_states(self, user_ids: torch.Tensor, target_device: torch.device = None) -> torch.Tensor:
+        """讀取舊狀態"""
+        # index_select 的 index 必須與 tensor 在同一設備
+        if self.enable_cpu_offload:
+            # CPU -> GPU
+            ids_cpu = user_ids.cpu()
+            batch_states = self.states.index_select(0, ids_cpu)
+            return batch_states.to(target_device, non_blocking=True)
+        else:
+            # GPU -> GPU (Zero Copy, Ultra Fast)
+            return self.states.index_select(0, user_ids)
     
-    else:
-        raise ValueError(f"Unsupported embedding dimension: {embeddings.dim()}")
+    def update_batch_states(self, user_ids: torch.Tensor, new_states: torch.Tensor):
+        """寫入新狀態"""
+        # Detach 截斷梯度流
+        new_states_detached = new_states.detach()
+        
+        if self.enable_cpu_offload:
+            # GPU -> CPU
+            ids_cpu = user_ids.cpu()
+            states_cpu = new_states_detached.cpu()
+            self.states.index_copy_(0, ids_cpu, states_cpu)
+        else:
+            # GPU -> GPU
+            self.states.index_copy_(0, user_ids, new_states_detached)
 
 # ===================================================================
-#  標準 Transformer 組件
+#  Core Component 2: Robust Titans Layer
+# ===================================================================
+
+class TitansLayer(nn.Module):
+    """
+    Titans: Linear Memory with Delta Rule (Robust Version)
+    """
+    def __init__(self, d_model, dim_feedforward=2048, dropout=0.1):
+        super().__init__()
+        self.d_model = d_model
+        
+        # Projections
+        # Q 用於 Predict (來源是 User Static)
+        self.proj_q = nn.Linear(d_model, d_model, bias=False)
+        
+        # K, V, Gates 用於 Update (來源是 Item)
+        self.proj_k = nn.Linear(d_model, d_model, bias=False)
+        self.proj_v = nn.Linear(d_model, d_model, bias=False)
+        self.proj_alpha = nn.Linear(d_model, 1) 
+        self.proj_eta = nn.Linear(d_model, 1)   
+        
+        # Output components
+        self.proj_out = nn.Linear(d_model, d_model)
+        
+        # FFN
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.activation = F.relu
+        
+        self.scale = d_model ** -0.5
+
+    def predict(self, user_static_emb, old_state):
+        """
+        Step 1: 預測 (Read). 使用 User Static Feature 去查詢 Memory
+        user_static_emb: [B, D]
+        old_state: [B, D, D]
+        Return: user_dynamic_emb [B, D]
+        """
+        # Pre-Norm
+        x_norm = self.norm1(user_static_emb)
+        
+        # Generate Query
+        q = self.proj_q(x_norm) # [B, D]
+        q = F.normalize(q, p=2, dim=-1)
+        q_vec = q.unsqueeze(2) # [B, D, 1]
+        
+        # Retrieval: y = S_{t-1} * q
+        # 這是 User 結合了歷史記憶後的當下狀態
+        read_content = torch.bmm(old_state, q_vec).squeeze(2) # [B, D]
+        
+        # Pass through Output Projection & FFN
+        attn_output = self.proj_out(read_content)
+        x = user_static_emb + self.dropout1(attn_output) # Residual with input
+        
+        x2 = self.norm2(x)
+        ffn_out = self.linear2(self.dropout(self.activation(self.linear1(x2))))
+        user_dynamic_emb = x + self.dropout2(ffn_out)
+        
+        return user_dynamic_emb
+
+    def update(self, item_emb, old_state):
+        """
+        Step 2: 更新 (Write). 使用 Item 去更新 Memory
+        item_emb: [B, D] - 當前互動的 Item (Target)
+        old_state: [B, D, D]
+        Return: new_state [B, D, D]
+        """
+        # Pre-Norm Item
+        i_norm = self.norm1(item_emb)
+        
+        # Generate K, V, Gates from Item
+        k = self.proj_k(i_norm)
+        v = self.proj_v(i_norm)
+        k = F.normalize(k, p=2, dim=-1)
+        
+        alpha = torch.sigmoid(self.proj_alpha(i_norm)) # [B, 1]
+        eta = torch.sigmoid(self.proj_eta(i_norm)) * self.scale
+        
+        # Reshape
+        k_vec = k.unsqueeze(2) # [B, D, 1]
+        v_vec = v.unsqueeze(2) # [B, D, 1]
+        
+        # Memory Update (Delta Rule)
+        # 1. Reconstruction: v_hat = S * k
+        pred = torch.bmm(old_state, k_vec)
+        
+        # 2. Surprise: e = v - v_hat
+        error = v_vec - pred
+        
+        # 3. Update: S_new = (1-a)S + eta * (e * k^T)
+        alpha_bc = alpha.unsqueeze(2)
+        update_term = torch.bmm(error, k_vec.transpose(1, 2))
+        
+        new_state = (1 - alpha_bc) * old_state + eta.unsqueeze(2) * update_term
+        
+        return new_state
+
+# ===================================================================
+#  Core Component 3: Standard Transformer (Item Side)
 # ===================================================================
 
 class StandardTransformerLayer(nn.Module):
     def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1):
         super().__init__()
         self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
-        
-        # 標準 FFN: Linear -> Activation -> Dropout -> Linear
         self.linear1 = nn.Linear(d_model, dim_feedforward)
         self.dropout = nn.Dropout(dropout)
         self.linear2 = nn.Linear(dim_feedforward, d_model)
-        
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.dropout1 = nn.Dropout(dropout)
@@ -92,438 +220,223 @@ class StandardTransformerLayer(nn.Module):
         self.activation = F.relu
 
     def forward(self, src, src_mask=None, src_key_padding_mask=None):
-        # 1. Self-Attention Block (Pre-Norm)
         src2 = self.norm1(src)
         attn_output, _ = self.self_attn(src2, src2, src2, attn_mask=src_mask, key_padding_mask=src_key_padding_mask)
         src = src + self.dropout1(attn_output)
-        
-        # 2. FFN Block (Pre-Norm)
         src2 = self.norm2(src)
         ffn_out = self.linear1(src2)
         ffn_out = self.activation(ffn_out)
         ffn_out = self.dropout(ffn_out)
         ffn_out = self.linear2(ffn_out)
         src = src + self.dropout2(ffn_out)
-        
         return src
 
-class IndependentCMS(nn.Module):
-    """
-    [Phase 1 Core] Independent Continuum Memory System
-    一個持續演化的 MLP，用於捕捉 Item 的 ID/Category 級別的趨勢偏差。
-    不重置，隨時間學習。
-    """
-    def __init__(self, input_dim, hidden_dim, output_dim=None, dropout=0.1):
-        super().__init__()
-        
-        # 如果沒有指定 output_dim，則預設等於 input_dim
-        if output_dim is None:
-            output_dim = input_dim
-            
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.SiLU(), 
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, output_dim) 
-        )
-        
-        # Zero-Init
-        nn.init.zeros_(self.net[-1].weight)
-        nn.init.zeros_(self.net[-1].bias)
-
-    def forward(self, x):
-        return self.net(x)
-    
-class TitansLayer(nn.Module):
-    """
-    User Tower 專用的 Titans Layer (Linear Memory with Delta Rule)
-    取代原本的 Self-Attention
-    """
-    def __init__(self, d_model, dim_feedforward=2048, dropout=0.1):
-        super().__init__()
-        self.d_model = d_model
-        
-        # 1. Projections for Memory Operations
-        # q, k, v 投影
-        self.proj_q = nn.Linear(d_model, d_model, bias=False)
-        self.proj_k = nn.Linear(d_model, d_model, bias=False)
-        self.proj_v = nn.Linear(d_model, d_model, bias=False)
-        
-        # Gating Projections (Data-dependent decay & learning rate)
-        # 這些控制模型要 "忘記多少" 和 "寫入多少"
-        self.proj_alpha = nn.Linear(d_model, 1) # Forget gate
-        self.proj_eta = nn.Linear(d_model, 1)   # Input gate
-        
-        # 2. Output Projection
-        self.proj_out = nn.Linear(d_model, d_model)
-        
-        # 3. Standard FFN (保持非線性能力)
-        self.linear1 = nn.Linear(d_model, dim_feedforward)
-        self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(dim_feedforward, d_model)
-        
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.dropout1 = nn.Dropout(dropout)
-        self.dropout2 = nn.Dropout(dropout)
-        self.activation = F.relu
-
-    def forward(self, x, src_mask=None, src_key_padding_mask=None):
-        """
-        x: [Batch, Seq, Dim]
-        注意：Titans 是遞歸的，通常不需要 Causal Mask (因為 t 只能看到 t-1)
-        但需要處理 padding mask (即忽略 padding 位置的更新)
-        """
-        B, T, D = x.shape
-        
-        # Pre-Norm
-        x_norm = self.norm1(x)
-        
-        # Projections
-        q = self.proj_q(x_norm) # [B, T, D]
-        k = self.proj_k(x_norm) # [B, T, D]
-        v = self.proj_v(x_norm) # [B, T, D]
-
-        q = F.normalize(q, p=2, dim=-1)
-        k = F.normalize(k, p=2, dim=-1)
-        
-        # Gates: Sigmoid 確保在 [0, 1] 之間
-        alpha = torch.sigmoid(self.proj_alpha(x_norm)) # [B, T, 1]
-        eta = torch.sigmoid(self.proj_eta(x_norm))     # [B, T, 1]
-        
-        # Memory Initialization (S_0 = 0)
-        # State: [B, D, D]
-        state = torch.zeros(B, D, D, device=x.device)
-        
-        outputs = []
-        
-        # Recurrent Loop (Time-step wise)
-        for t in range(T):
-            # 取出當前 step 的變數
-            kt = k[:, t, :].unsqueeze(2) # [B, D, 1]
-            vt = v[:, t, :].unsqueeze(2) # [B, D, 1]
-            qt = q[:, t, :].unsqueeze(1) # [B, 1, D]
-            at = alpha[:, t, :].unsqueeze(2) # [B, 1, 1]
-            et = eta[:, t, :].unsqueeze(2)   # [B, 1, 1]
-            
-            # --- 1. Retrieval (Read) ---
-            # y_t = q_t * S_{t-1}
-            # [B, 1, D] @ [B, D, D] -> [B, 1, D]
-            read_content = torch.bmm(qt, state).squeeze(1) # [B, D]
-            
-            # --- 2. Update (Write) with Delta Rule ---
-            # Pred = S_{t-1} * k_t
-            pred = torch.bmm(state, kt) # [B, D, 1]
-            
-            # Error = v_t - Pred
-            # 自我參照誤差：只有當預測不準時才更新
-            error = vt - pred 
-            
-            # S_t = (1 - alpha) * S_{t-1} + eta * (Error * k_t^T)
-            # 處理 Padding: 如果該位置是 padding，則 alpha=0, eta=0 (不更新)
-            if src_key_padding_mask is not None:
-                # mask is True for padding
-                mask_t = (~src_key_padding_mask[:, t]).float().view(B, 1, 1)
-                at = at * mask_t
-                et = et * mask_t
-                
-            update_term = torch.bmm(error, kt.transpose(1, 2)) # [B, D, D]
-            state = (1 - at) * state + et * update_term
-            
-            outputs.append(read_content)
-            
-        # Stack outputs -> [B, T, D]
-        attn_output = torch.stack(outputs, dim=1)
-        attn_output = self.proj_out(attn_output)
-
-        if torch.isnan(attn_output).any():
-            print("[Warning] Titans produced NaN, replacing with zeros for safety.")
-            attn_output = torch.nan_to_num(attn_output, nan=0.0)
-        
-        # Residual 1
-        x = x + self.dropout1(attn_output)
-        
-        # FFN Block
-        x2 = self.norm2(x)
-        ffn_out = self.linear2(self.dropout(self.activation(self.linear1(x2))))
-        x = x + self.dropout2(ffn_out)
-        
-        return x
-    
 # ===================================================================
-#  主模型: Dual-Tower SASRec
+#  Helper: Average Pooling
+# ===================================================================
+def average_pooling(embeddings: torch.Tensor, seq_lens: torch.Tensor) -> torch.Tensor:
+    if embeddings.dim() == 4: 
+        max_len = embeddings.size(2)
+        mask = torch.arange(max_len, device=embeddings.device)[None, None, :] < seq_lens.unsqueeze(-1)
+        mask = mask.float().unsqueeze(-1) 
+        masked_sum = torch.sum(embeddings * mask, dim=2)
+        count = mask.sum(dim=2) + 1e-9
+        return masked_sum / count
+    elif embeddings.dim() == 3: 
+        max_len = embeddings.size(1)
+        mask = torch.arange(max_len, device=embeddings.device)[None, :] < seq_lens[:, None]
+        mask = mask.float().unsqueeze(-1) 
+        masked_sum = torch.sum(embeddings * mask, dim=1)
+        count = mask.sum(dim=1) + 1e-9
+        return masked_sum / count
+    raise ValueError(f"Unsupported dim: {embeddings.dim()}")
+
+# ===================================================================
+#  Main Model: DualTowerTitans
 # ===================================================================
 
-class TitansDualTowerSASRec(nn.Module):
+class DualTowerTitans(nn.Module):
     def __init__(self, global_meta: Dict[str, Any], cfg: Dict[str, Any]):
         super().__init__()
-        
-        # 1. 配置管理
         self.hparams = cfg['model']
         self.temperature = 0.07 
         self.maxlen = self.hparams.get('max_seq_len', 30)
         
-        # 2. 註冊 Buffer (不可訓練的靜態資料)
+        # Buffers
         self.register_buffer('cates', torch.from_numpy(global_meta['cate_matrix']))
         self.register_buffer('cate_lens', torch.tensor(global_meta['cate_lens'], dtype=torch.int32))
         
-        # 3. 模組構建
-        self._build_embeddings()
-        self._build_encoders()
-        self._build_adaptive_modules() # [新增] 構建 CMS 等適應性模組
-        self._build_prediction_heads()
+        # Dimensions
+        self.embed_dim = self.hparams['item_embed_dim']
         
-        # 4. 初始化
+        self.user_emb_dim = self.embed_dim
+        self.item_emb_dim = self.embed_dim
+        self.cate_emb_dim = self.embed_dim 
+        
+        # Tower Input Dimensions
+        self.user_tower_input_dim = self.embed_dim 
+        self.item_tower_input_dim = self.embed_dim
+        
+        # 1. Embeddings
+        self._build_embeddings()
+        
+        # 2. Titans Memory Bank 
+        # [Update] 讀取 Config 決定是否開啟 CPU Offload
+        enable_cpu_offload = self.hparams.get('titans_cpu_offload', False)
+        self.user_memory_bank = UserMemoryBank(
+            n_users=self.hparams['n_users'], 
+            d_model=self.user_tower_input_dim,
+            enable_cpu_offload=enable_cpu_offload
+        )
+        
+        # 3. Encoders (Titans & Transformer)
+        self._build_encoders()
+        
+        # 4. Heads
+        self.user_mlp = self._create_mlp(self.user_emb_dim * 2) # Static + Dynamic
+        self.item_mlp = self._create_mlp(self.item_emb_dim * 2) # Static + History
+
+        # 5. Negatives Buffer
+        self.user_history_buffer = nn.Embedding(self.hparams['n_items'], self.item_emb_dim)
+        self.user_history_buffer.weight.requires_grad = False
+        
         self._init_weights()
 
     def _build_embeddings(self):
-        # ID Embeddings
-        self.user_emb_w = nn.Embedding(self.hparams['n_users'], self.hparams['user_embed_dim'])
-        self.item_emb_w = nn.Embedding(self.hparams['n_items'], self.hparams['item_embed_dim'])
-        self.cate_emb_w = nn.Embedding(self.hparams['n_cates'], self.hparams['cate_embed_dim'])
+        self.user_emb_w = nn.Embedding(self.hparams['n_users'], self.user_emb_dim)
+        self.item_emb_w = nn.Embedding(self.hparams['n_items'], self.item_emb_dim)
+        self.cate_emb_w = nn.Embedding(self.hparams['n_cates'], self.cate_emb_dim)
 
-        # Positional Embeddings
-        # Item Tower Input Dim = Item ID + Category
-        self.item_seq_input_dim = self.hparams['item_embed_dim'] + self.hparams['cate_embed_dim']
-        self.item_seq_pos_emb = nn.Embedding(self.maxlen, self.item_seq_input_dim)
-        
-        # User Tower Input Dim = User ID
-        self.user_seq_input_dim = self.hparams['user_embed_dim']
-        self.user_seq_pos_emb = nn.Embedding(self.maxlen, self.user_seq_input_dim)
-
-        # Buffer for Negatives (History Lookup)
-        history_embed_dim = self.hparams['item_embed_dim']
-        self.user_history_buffer = nn.Embedding(self.hparams['n_items'], history_embed_dim)
-        self.user_history_buffer.weight.requires_grad = False
+        # Positional Embedding (只給 Item Tower 的 Transformer 用)
+        self.item_tower_pos_emb = nn.Embedding(self.maxlen, self.item_tower_input_dim)
 
     def _build_encoders(self):
-        # Helper for Transformer Stack
-        def _make_transformer_stack(input_dim):
-            return nn.ModuleList([
-                StandardTransformerLayer(
-                    d_model=input_dim,
-                    nhead=self.hparams.get('transformer_n_heads', 4),
-                    dim_feedforward=input_dim * 4,
-                    dropout=self.hparams.get('transformer_dropout', 0.1)
-                )
-                for _ in range(self.hparams.get('transformer_n_layers', 2))
-            ])
-            
-        # Helper for Titans Stack
-        def _make_titans_stack(input_dim):
-            return nn.ModuleList([
-                TitansLayer(
-                    d_model=input_dim,
-                    dim_feedforward=input_dim * 4,
-                    dropout=self.hparams.get('transformer_dropout', 0.1)
-                )
-                for _ in range(self.hparams.get('transformer_n_layers', 2))
-            ])
-
-        # --- User Tower ---
-        # [Phase 2] 切換開關
-        if self.hparams.get('user_tower_type', 'titans') == 'titans':
-            print("--- [Model] User Tower using Self-Referential Titans ---")
-            self.item_seq_transformer = _make_titans_stack(self.item_seq_input_dim)
-        else:
-            self.item_seq_transformer = _make_transformer_stack(self.user_seq_input_dim)
+        # --- User Tower: Titans (Single Layer for State Update) ---
+        # 為了狀態管理簡單，這裡使用單層 Titans 進行 Memory Update
+        # 如果需要更深網路，可以在 Titans 後面接 MLP
+        self.user_titans = TitansLayer(
+            d_model=self.user_tower_input_dim, # 192
+            dim_feedforward=self.user_tower_input_dim * 4,
+            dropout=self.hparams.get('transformer_dropout', 0.1)
+        )
         
-        # --- Item Tower ---
-        # 保持 Transformer (因為 Phase 1 證明它最穩)
-        self.user_seq_transformer = _make_transformer_stack(self.user_seq_input_dim)
+        # --- Item Tower: Transformer (Standard SASRec) ---
+        self.item_transformer = nn.ModuleList([
+            StandardTransformerLayer(
+                d_model=self.item_tower_input_dim, # 128
+                nhead=4,
+                dim_feedforward=self.item_tower_input_dim * 4,
+                dropout=0.1
+            ) for _ in range(self.hparams.get('transformer_n_layers', 2))
+        ])
 
-    def _build_adaptive_modules(self):
-        """[Phase 1] 構建適應性模組 (CMS)"""
-        self.use_cms = self.hparams.get('use_cms', False)
-        
-        if self.use_cms:
-            # CMS 輸入: Item Static (ID + Cate) -> 192
-            self.cms_input_dim = self.item_seq_input_dim
-            
-            # CMS 輸出: 必須對齊 Item History (User Emb) -> 128
-            self.cms_output_dim = self.user_seq_input_dim 
-            
-            self.cms_module = IndependentCMS(
-                input_dim=self.cms_input_dim,
-                hidden_dim=self.cms_input_dim * 2,
-                output_dim=self.cms_output_dim # [修正] 指定輸出維度
-            )
-        else:
-            self.cms_module = None
-
-    def _create_mlp(self, input_dim: int) -> nn.Sequential:
-        """標準 MLP Head"""
-        expansion_factor = 2
-        inner_dim = int(input_dim * expansion_factor)
-        dropout = 0.0 
-        
-        # PreNorm Residual MLP Block
-        class PreNormResidualBlock(nn.Module):
-            def __init__(self, dim, fn):
-                super().__init__()
-                self.fn = fn
-                self.norm = nn.LayerNorm(dim)
-            def forward(self, x):
-                return self.fn(self.norm(x)) + x
-
-        def _block():
-            return nn.Sequential(
-                nn.Linear(input_dim, inner_dim),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-                nn.Linear(inner_dim, input_dim),
-                nn.Dropout(dropout)
-            )
-            
+    def _create_mlp(self, input_dim):
         return nn.Sequential(
-            PreNormResidualBlock(input_dim, _block())
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, input_dim * 2),
+            nn.ReLU(),
+            nn.Linear(input_dim * 2, input_dim)
         )
 
-    def _build_prediction_heads(self):
-        """初始化最後的 Projection Heads"""
-        # Concat Dim = User Static + User Sequence (Item Features)
-        # 注意：這裡假設 Static 和 Sequence 維度拼接邏輯與之前一致
-        concat_dim = self.hparams['user_embed_dim'] + self.hparams['item_embed_dim'] + self.hparams['cate_embed_dim']
-        
-        self.user_mlp = self._create_mlp(concat_dim)
-        self.item_mlp = self._create_mlp(concat_dim)
-
     def _init_weights(self):
-        nn.init.xavier_uniform_(self.user_emb_w.weight)
-        nn.init.xavier_uniform_(self.item_emb_w.weight)
-        nn.init.xavier_uniform_(self.cate_emb_w.weight)
-        
-        def _init_mlp(m):
+        for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
-                nn.init.zeros_(m.bias)
-        
-        for mlp in [self.user_mlp, self.item_mlp]:
-            mlp.apply(_init_mlp)
+                if m.bias is not None: nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Embedding):
+                nn.init.xavier_uniform_(m.weight)
 
     # ===================================================================
-    #  Forward 邏輯
+    #  Forward Logic
     # ===================================================================
 
     def _lookup_item_features(self, item_ids: torch.Tensor) -> torch.Tensor:
-        """取得 Item Static + Category Features"""
-        static_emb = self.item_emb_w(item_ids)
+        # 1. Item ID Embedding
+        static_emb = self.item_emb_w(item_ids) # [B, D]
+        
+        # 2. Category Embedding (Average Pooling)
         item_cates = self.cates[item_ids]
         item_cates_emb = self.cate_emb_w(item_cates)
-        avg_cate_emb = average_pooling(item_cates_emb, self.cate_lens[item_ids])
-        return torch.cat([static_emb, avg_cate_emb], dim=-1)
-
-    def _run_transformer(self, seq_emb, seq_lens, layers_module_list, pos_emb_module=None, pooling_mode='last') -> torch.Tensor:
-        B, T, D = seq_emb.shape
-        device = seq_emb.device
+        avg_cate_emb = average_pooling(item_cates_emb, self.cate_lens[item_ids]) # [B, D]
         
-        # 1. Positional Encoding
-        if pos_emb_module is not None:
-            pos_ids = torch.arange(T, dtype=torch.long, device=device)
-            seq_input = seq_emb + pos_emb_module(pos_ids).unsqueeze(0)
-        else:
-            seq_input = seq_emb
-        
-        # 2. Masks
-        # 如果是 TitansLayer，它不需要 Causal Mask (src_mask)，只需要 Padding Mask
-        is_titans = isinstance(layers_module_list[0], TitansLayer)
-        
-        if not is_titans and pos_emb_module is not None:
-            src_mask = nn.Transformer.generate_square_subsequent_mask(T, device=device).bool()
-        else:
-            src_mask = None 
-
-        safe_lens = torch.clamp(seq_lens, min=1)
-        padding_mask = (torch.arange(T, device=device)[None, :] >= safe_lens[:, None])
-        
-        # 3. Layers Forward
-        output = seq_input
-        for layer in layers_module_list:
-            if is_titans:
-                # Titans 介面稍有不同，只傳需要的
-                output = layer(output, src_key_padding_mask=padding_mask)
-            else:
-                output = layer(output, src_mask=src_mask, src_key_padding_mask=padding_mask)
-            
-        # 4. Pooling Strategy (保持不變)
-        if pooling_mode == 'last':
-            target_indices = (seq_lens - 1).clamp(min=0).view(B, 1, 1).expand(-1, 1, D)
-            pooled_output = torch.gather(output, 1, target_indices).squeeze(1)
-        elif pooling_mode == 'mean':
-            pooled_output = average_pooling(output, seq_lens)
-        
-        mask_zero = (seq_lens == 0).unsqueeze(-1).expand(-1, D)
-        pooled_output = pooled_output.masked_fill(mask_zero, 0.0)
-        
-        return pooled_output
+        # [修改] 改為相加 (Additive)
+        # 這樣維度保持為 D，不會變成 D + D_cate
+        return static_emb + avg_cate_emb
 
     def _build_feature_representations(self, batch: Dict) -> Tuple[torch.Tensor, torch.Tensor]:
-        """構建 User 與 Item 的特徵向量"""
         
-        # --- 1. User Tower ---
-        # Input: User ID + User History (Items)
+        # ---------------------------------------------------
+        # 1. User Tower (Titans - Stateful)
+        # ---------------------------------------------------
+        # --- 1. User Tower (Stateful Streaming) ---
         user_static = self.user_emb_w(batch['user_id'])
         
-        # Lookup history items
-        hist_item_features = self._lookup_item_features(batch['user_interacted_items'])
-        hist_item_features = hist_item_features.detach() # Stop gradient to item emb
+        # 從 Memory Bank 讀取 "更新前" 的狀態
+        old_state = self.user_memory_bank.get_batch_states(batch['user_id'], user_static.device)
         
-        # Run Transformer
-        user_history_emb = self._run_transformer(
-            hist_item_features, 
-            batch['user_interacted_len'], 
-            self.item_seq_transformer, 
-            # self.item_seq_pos_emb,
-            pos_emb_module=None,  # <--- Set Transformer Mode
-            pooling_mode='last'
-        )
+        # [Phase A: Predict] 
+        # 使用 User Static + Old State 產生 User Feature
+        # 這裡完全沒用到 current item，所以絕對沒有 Leakage
+        titans_out = self.user_titans.predict(user_static, old_state)
         
-        user_features = torch.cat([user_static, user_history_emb], dim=-1)
+        # 這裡可以選擇 concat(static, dynamic) 或者直接用 dynamic
+        # 假設我們 concat 以保留最強的 ID 訊號
+        user_features = torch.cat([user_static, titans_out], dim=-1)
 
-        # --- 2. Item Tower ---
-        # Input: Item ID/Cate + Item History (Users)
-        item_composite_static = self._lookup_item_features(batch['item_id'])
-        
-        item_hist_user_ids = batch['item_interacted_users']
-        item_hist_emb = self.user_emb_w(item_hist_user_ids).detach() # Stop gradient to user emb
-        
-        # Run Transformer
-        item_history_emb = self._run_transformer(
-            item_hist_emb, 
-            batch['item_interacted_len'], 
-            self.user_seq_transformer, 
-            pos_emb_module=self.user_seq_pos_emb,
-            # pos_emb_module=None,  # <--- Set Transformer Mode
-            pooling_mode='last'
-        )
-        
-        # [Phase 1: CMS Trend Injection]
-        if self.use_cms:
-            # CMS 根據靜態 ID/Cate 預測趨勢偏差
-            trend_bias = self.cms_module(item_composite_static)
-            # Additive Injection: Item Embedding = CF_Agg + Trend
-            item_history_emb = item_history_emb + trend_bias
-        
-        item_features = torch.cat([item_composite_static, item_history_emb], dim=-1)
+        # [Phase B: Update Preparation]
+        # 準備好要用來更新的新狀態，但不參與這裡的 User Embedding 計算
+        # 我們使用當前互動的 Item 來更新 User 的記憶
+        current_item_features = self._lookup_item_features(batch['item_id']).detach()
+        new_state = self.user_titans.update(current_item_features, old_state)
 
-        # --- Cache Update Mechanism ---
+        # [State Update] 只在訓練時更新 Memory Bank
         if self.training:
-            # 將當前 Batch 計算好的 Item History Embedding 存入 Buffer 供推論時的負樣本使用
+            self.user_memory_bank.update_batch_states(batch['user_id'], new_state)
+            
+
+        # ---------------------------------------------------
+        # 2. Item Tower (Transformer - Stateless)
+        # ---------------------------------------------------
+        item_composite_static = self._lookup_item_features(batch['item_id'])
+        B, _ = item_composite_static.shape
+
+        
+        # Input: User Sequence
+        item_hist_user_ids = batch['item_interacted_users']
+        item_hist_emb = self.user_emb_w(item_hist_user_ids).detach()
+        seq_len_i = batch['item_interacted_len']
+        
+        # Add Positional Embedding
+        pos_ids = torch.arange(item_hist_emb.size(1), device=item_hist_emb.device)
+        item_seq_input = item_hist_emb + self.item_tower_pos_emb(pos_ids).unsqueeze(0)
+        
+        # Masks (Causal + Padding)
+        src_mask = nn.Transformer.generate_square_subsequent_mask(item_hist_emb.size(1), device=item_hist_emb.device).bool()
+        safe_lens_i = torch.clamp(seq_len_i, min=1)
+        padding_mask_i = (torch.arange(item_hist_emb.size(1), device=item_hist_emb.device)[None, :] >= safe_lens_i[:, None])
+        
+        # Transformer Forward
+        output = item_seq_input
+        for layer in self.item_transformer:
+            output = layer(output, src_mask=src_mask, src_key_padding_mask=padding_mask_i)
+            
+        # Pooling (Last)
+        target_indices_i = (seq_len_i - 1).clamp(min=0).view(B, 1, 1).expand(-1, 1, self.item_tower_input_dim)
+        item_history_emb = torch.gather(output, 1, target_indices_i).squeeze(1)
+        
+        # Update Negatives Buffer
+        if self.training:
             self.user_history_buffer.weight[batch['item_id']] = item_history_emb.detach()
+            
+        item_features = torch.cat([item_composite_static, item_history_emb], dim=-1)
 
         return user_features, item_features
 
     def forward(self, batch: Dict) -> Tuple[torch.Tensor, torch.Tensor]:
         user_features, item_features = self._build_feature_representations(batch)
         
-        # Projection Heads
-        user_embedding = self.user_mlp(user_features)
-        item_embedding = self.item_mlp(item_features)
-        
-        # Normalize
-        user_embedding = F.normalize(user_embedding, p=2, dim=-1)
-        item_embedding = F.normalize(item_embedding, p=2, dim=-1)
+        user_embedding = F.normalize(self.user_mlp(user_features), p=2, dim=-1, eps=1e-6)
+        item_embedding = F.normalize(self.item_mlp(item_features), p=2, dim=-1, eps=1e-6)
         
         return user_embedding, item_embedding
 
@@ -552,7 +465,6 @@ class TitansDualTowerSASRec(nn.Module):
 
     def inference(self, batch: Dict[str, torch.Tensor], neg_item_ids_batch: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         user_features, item_features = self._build_feature_representations(batch)
-        pos_user_emb, pos_item_emb = self.forward(batch) 
         pos_user_emb = F.normalize(self.user_mlp(user_features), p=2, dim=-1)
         pos_item_emb = F.normalize(self.item_mlp(item_features), p=2, dim=-1)
         
@@ -565,7 +477,7 @@ class TitansDualTowerSASRec(nn.Module):
         neg_item_cate_emb = self.cate_emb_w(self.cates[neg_item_ids_batch])
         neg_item_cates_len = self.cate_lens[neg_item_ids_batch]
         avg_cate_emb_for_neg_item = average_pooling(neg_item_cate_emb, neg_item_cates_len) 
-        neg_item_emb_with_cate = torch.cat([neg_item_static_emb, avg_cate_emb_for_neg_item], dim=2) 
+        neg_item_emb_with_cate = neg_item_static_emb + avg_cate_emb_for_neg_item # [B, Neg, D]
         
         item_history_emb_expanded = self.user_history_buffer(neg_item_ids_batch)
         neg_item_features = torch.cat([neg_item_emb_with_cate, item_history_emb_expanded.detach()], dim=2)

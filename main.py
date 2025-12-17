@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 
 # 引入重構後的模組
 from model import DualTowerSASRec
-from model_titans import TitansDualTowerSASRec
+from model_titans import DualTowerTitans
 
 from utils import (
     prepare_data_pipeline,
@@ -75,8 +75,8 @@ class StreamingTrainer:
         
         if model_type == 'dual_tower_sasrec':
             model = DualTowerSASRec(global_meta=self.global_meta, cfg=self.cfg).to(self.device)
-        elif model_type == 'titans_dual_tower':
-            model = TitansDualTowerSASRec(global_meta=self.global_meta, cfg=self.cfg).to(self.device)
+        elif model_type == 'dual_tower_titans':
+            model = DualTowerTitans(global_meta=self.global_meta, cfg=self.cfg).to(self.device)
         else:
             raise ValueError(f"Unknown model_type: {model_type}")
             
@@ -163,7 +163,11 @@ class StreamingTrainer:
             train_df = curr_df.iloc[:split_idx]
             val_df = curr_df.iloc[split_idx:]
             
-            train_loader = self._get_dataloader(train_df, shuffle=True)
+            if self.cfg['model_type'] == 'dual_tower_titans': 
+                shuffle = False
+            else:
+                shuffle = True
+            train_loader = self._get_dataloader(train_df, shuffle=shuffle)
             val_loader = self._get_dataloader(val_df, shuffle=False) if not val_df.empty else None
             
             # 4. 訓練 (Training)
