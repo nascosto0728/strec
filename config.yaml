@@ -35,6 +35,7 @@ model:
   item_embed_dim: 32
   output_dim: 32
   cate_embed_dim: 32
+  titans_n_heads: 4  # Head dim = 8
 
   titans_cpu_offload: false  # Titans CPU Offload 選項
 

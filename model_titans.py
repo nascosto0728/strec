@@ -48,63 +48,206 @@ def _debug_check(name: str, x, verbose: bool = False, raise_on_error: bool = Fal
 class UserMemoryBank:
     """
     全域使用者記憶體庫 (Global User Memory Bank)
-    支援 enable_cpu_offload 選項
-    - True: 儲存在 CPU (節省顯存，適合大維度)
-    - False: 儲存在 GPU (速度最快，適合小維度)
+    [Update] 支援多維度狀態 (Multi-Head State: N x H x Dh x Dh)
     """
-    def __init__(self, n_users: int, d_model: int,  enable_cpu_offload: bool = False):
+    def __init__(self, n_users: int, state_shape: Tuple[int, ...], enable_cpu_offload: bool = False):
         self.n_users = n_users
-        self.d_model = d_model
+        self.state_shape = state_shape # e.g., (4, 8, 8) for H=4, Dh=8
         self.enable_cpu_offload = enable_cpu_offload
         
-        # 計算記憶體大小
-        mem_size_gb = (n_users * d_model * d_model * 4) / (1024**3)
-        location = "CPU" if enable_cpu_offload else "GPU"
+        # 計算總元素數量
+        state_numel = math.prod(state_shape)
+        mem_size_gb = (n_users * state_numel * 4) / (1024**3)
         
-        # 安全檢查 device
+        location = "CPU" if enable_cpu_offload else "GPU"
         if not enable_cpu_offload and torch.cuda.is_available():
              location += f" (device={torch.cuda.current_device()})"
-        
-        print(f"--- [MemoryBank] Allocating {n_users}x{d_model}x{d_model} state matrix on {location} ---")
+             
+        print(f"--- [MemoryBank] Allocating {n_users}x{state_shape} state on {location} ---")
         print(f"--- [MemoryBank] Estimated Size: {mem_size_gb:.2f} GB ---")
         
+        # 完整 shape: [N_USERS, H, Dh, Dh]
+        full_shape = (n_users,) + state_shape
+        
         if enable_cpu_offload:
-            # CPU Mode: 使用 pin_memory 加速傳輸
-            self.states = torch.zeros(n_users, d_model, d_model, dtype=torch.float32, pin_memory=True)
+            self.states = torch.zeros(full_shape, dtype=torch.float32, pin_memory=True)
         else:
-            # GPU Mode: 直接在 GPU 上分配
             device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-            self.states = torch.zeros(n_users, d_model, d_model, dtype=torch.float32, device=device)
+            self.states = torch.zeros(full_shape, dtype=torch.float32, device=device)
         
     def get_batch_states(self, user_ids: torch.Tensor, target_device: torch.device = None) -> torch.Tensor:
-        """讀取舊狀態 (Detached from history because it's from storage)"""
-        # index_select 的 index 必須與 tensor 在同一設備
         if self.enable_cpu_offload:
-            # CPU -> GPU
             ids_cpu = user_ids.cpu()
             batch_states = self.states.index_select(0, ids_cpu)
             return batch_states.to(target_device, non_blocking=True)
         else:
-            # GPU -> GPU (Zero Copy)
             return self.states.index_select(0, user_ids)
     
     def update_batch_states(self, user_ids: torch.Tensor, new_states: torch.Tensor):
-        """寫入新狀態"""
-        # Detach 截斷梯度流，避免顯存洩漏
         new_states_detached = new_states.detach()
-        
         if self.enable_cpu_offload:
-            # GPU -> CPU
             ids_cpu = user_ids.cpu()
             states_cpu = new_states_detached.cpu()
             self.states.index_copy_(0, ids_cpu, states_cpu)
         else:
-            # GPU -> GPU
             self.states.index_copy_(0, user_ids, new_states_detached)
 
 # ===================================================================
 #  Core Component 2: Robust Titans Layer
 # ===================================================================
+
+class MultiHeadMetaGatedTitansLayer(nn.Module):
+    """
+    Multi-Head Meta-Gated Titans
+    - H 個獨立的 Memory Heads
+    - 共享的 Meta-Controller 產生每個 Head 的調變參數
+    """
+    def __init__(self, d_model, n_heads=4, dim_feedforward=2048, dropout=0.1):
+        super().__init__()
+        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
+        
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        
+        # --- 1. Projections (All Heads together) ---
+        # Q, K, V 投影後會被切分成 H 份
+        self.proj_q = nn.Linear(d_model, d_model, bias=False)
+        self.proj_k = nn.Linear(d_model, d_model, bias=False)
+        self.proj_v = nn.Linear(d_model, d_model, bias=False)
+        
+        # Base Gates (預設值)
+        # 這裡我們讓每個 Head 有自己獨立的 bias
+        self.proj_alpha = nn.Linear(d_model, n_heads) 
+        self.proj_eta = nn.Linear(d_model, n_heads)   
+        
+        # --- 2. Meta-Controller ---
+        # Input: User Static (D) + Memory Context (D) = 2D
+        # Output: 
+        #   - Gamma (D): Feature Scaling (Per Dimension)
+        #   - Beta (D): Feature Shifting (Per Dimension)
+        #   - Alpha_bias (H): Forget Gate Bias (Per Head)
+        #   - Eta_bias (H): Input Gate Bias (Per Head)
+        self.meta_controller = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.LayerNorm(d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, d_model * 2 + n_heads * 2) 
+        )
+        
+        # --- 3. Output Fusion ---
+        self.proj_out = nn.Linear(d_model, d_model)
+        
+        # FFN
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.activation = F.relu
+        
+        self.scale = self.head_dim ** -0.5
+
+    def _read_memory(self, query_emb, state):
+        """
+        Multi-Head Memory Read
+        query_emb: [B, D] -> reshape to [B, H, Dh]
+        state: [B, H, Dh, Dh]
+        """
+        B = query_emb.size(0)
+        
+        # Project & Reshape Q
+        q = self.proj_q(query_emb) # [B, D]
+        q = q.view(B, self.n_heads, self.head_dim) # [B, H, Dh]
+        q = F.normalize(q, p=2, dim=-1)
+        
+        # Read: y_h = S_h * q_h
+        # [B, H, Dh, Dh] @ [B, H, Dh, 1] -> [B, H, Dh, 1]
+        q_vec = q.unsqueeze(-1)
+        read_content = torch.matmul(state, q_vec).squeeze(-1) # [B, H, Dh]
+        
+        # Flatten back to [B, D]
+        return read_content.view(B, self.d_model)
+
+    def predict(self, user_static_emb, old_state):
+        x_norm = self.norm1(user_static_emb)
+        
+        # Read from multi-head memory
+        read_content = self._read_memory(x_norm, old_state)
+        
+        # Fusion & FFN
+        attn_output = self.proj_out(read_content)
+        x = user_static_emb + self.dropout1(attn_output)
+        
+        x2 = self.norm2(x)
+        ffn_out = self.linear2(self.dropout(self.activation(self.linear1(x2))))
+        user_dynamic_emb = x + self.dropout2(ffn_out)
+        
+        return user_dynamic_emb
+
+    def update(self, item_emb, old_state, user_static_emb):
+        """
+        Multi-Head Meta-Gated Update
+        item_emb: [B, D]
+        old_state: [B, H, Dh, Dh]
+        """
+        B, D = item_emb.shape
+        H, Dh = self.n_heads, self.head_dim
+        
+        # 1. Meta-Context Preparation
+        x_static_norm = self.norm1(user_static_emb)
+        memory_context = self._read_memory(x_static_norm, old_state) # [B, D]
+        
+        meta_input = torch.cat([x_static_norm, memory_context], dim=-1) # [B, 2D]
+        
+        # 2. Meta-Controller Output
+        meta_out = self.meta_controller(meta_input) # [B, 2D + 2H]
+        
+        # Split outputs
+        gamma = meta_out[:, :D]        # [B, D]
+        beta = meta_out[:, D:2*D]      # [B, D]
+        alpha_bias = meta_out[:, 2*D:2*D+H] # [B, H]
+        eta_bias = meta_out[:, -H:]         # [B, H]
+        
+        # 3. Feature Modulation (on flattened D)
+        i_norm = self.norm1(item_emb)
+        modulation_scale = 1.0 + torch.tanh(gamma)
+        modulated_item = i_norm * modulation_scale + beta
+        
+        # 4. Multi-Head Projections
+        k = self.proj_k(modulated_item).view(B, H, Dh)
+        v = self.proj_v(modulated_item).view(B, H, Dh)
+        k = F.normalize(k, p=2, dim=-1) # L2 Norm per head
+        
+        # 5. Adaptive Gating (Per Head)
+        # alpha_logits: [B, H]
+        alpha_logits = self.proj_alpha(modulated_item) + alpha_bias
+        eta_logits = self.proj_eta(modulated_item) + eta_bias
+        
+        alpha = torch.sigmoid(alpha_logits).view(B, H, 1, 1) # Broadcastable
+        eta = (torch.sigmoid(eta_logits) * self.scale).view(B, H, 1, 1)
+        
+        # 6. Memory Update (Per Head Parallel)
+        # k: [B, H, Dh] -> [B, H, Dh, 1]
+        k_vec = k.unsqueeze(-1)
+        v_vec = v.unsqueeze(-1)
+        
+        # Pred: [B, H, Dh, Dh] @ [B, H, Dh, 1] -> [B, H, Dh, 1]
+        pred = torch.matmul(old_state, k_vec)
+        error = v_vec - pred
+        
+        # Update: error @ k.T -> [B, H, Dh, 1] @ [B, H, 1, Dh] -> [B, H, Dh, Dh]
+        update_term = torch.matmul(error, k_vec.transpose(-1, -2))
+        
+        # Delta Rule
+        new_state = (1 - alpha) * old_state + eta * update_term
+        
+        return new_state
+    
+
 class MetaGatedTitansLayer(nn.Module):
     """
     Meta-Gated Titans: Self-Referential Memory Update
@@ -468,15 +611,26 @@ class DualTowerTitans(nn.Module):
         # Tower Input Dimensions
         self.user_tower_input_dim = self.embed_dim 
         self.item_tower_input_dim = self.embed_dim
+
+        # [Config] 設定 Head 數量，預設為 4
+        self.n_heads = self.hparams.get('titans_n_heads', 4)
+        self.head_dim = self.user_tower_input_dim // self.n_heads
+        
+        # 確保整除
+        assert self.user_tower_input_dim % self.n_heads == 0, \
+            f"Embed dim {self.user_tower_input_dim} not divisible by n_heads {self.n_heads}"
         
         # 1. Embeddings
         self._build_embeddings()
         
         # 2. Titans Memory Bank 
+        # State Shape: (H, Dh, Dh)
+        state_shape = (self.n_heads, self.head_dim, self.head_dim)
+        
         enable_cpu_offload = self.hparams.get('titans_cpu_offload', False)
         self.user_memory_bank = UserMemoryBank(
             n_users=self.hparams['n_users'], 
-            d_model=self.user_tower_input_dim,
+            state_shape=state_shape, # 傳入 Tuple
             enable_cpu_offload=enable_cpu_offload
         )
         
@@ -510,8 +664,9 @@ class DualTowerTitans(nn.Module):
 
     def _build_encoders(self):
         # --- User Tower: One Step Titans ---
-        self.user_titans = MetaGatedTitansLayer(
+        self.user_titans = MultiHeadMetaGatedTitansLayer(
             d_model=self.user_tower_input_dim,
+            n_heads=self.n_heads, # 傳入 head 數
             dim_feedforward=self.user_tower_input_dim * 4,
             dropout=self.hparams.get('transformer_dropout', 0.1)
         )
