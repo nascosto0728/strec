@@ -108,6 +108,33 @@ class StreamingTrainer:
             raise ValueError(f"Unknown model_type: {model_type}")
             
         return model
+    
+    def configure_optimizers(self, model, lr):
+        # 將參數分組
+        slow_params = []
+        fast_params = []
+        
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+                
+            # 辨識 Slow Lane 的參數
+            # 包含: CMS 的 slow_net 以及 Memory Bank (如果想要長期記憶更穩)
+            if 'slow_net' in name:
+                slow_params.append(param)
+                # print(f"[Optimizer] Slow Lane: {name}")
+            else:
+                fast_params.append(param)
+        
+        base_lr = lr
+        slow_lr_scale = 0.1 # 慢速通道只用 1/10 的速度更新
+        
+        optimizer = torch.optim.AdamW([
+            {'params': fast_params, 'lr': base_lr},
+            {'params': slow_params, 'lr': base_lr * slow_lr_scale}
+        ])
+        
+        return optimizer
 
     def _load_prev_period_weights(self, model: torch.nn.Module, period_id: int, lr: float):
         """嘗試載入上一個 Period 的最佳權重 (模擬串流繼承)"""
@@ -161,6 +188,7 @@ class StreamingTrainer:
             lr=lr, 
             weight_decay=self.cfg.get('weight_decay', 0.0)
         )
+        # optimizer = self.configure_optimizers(model, lr)
 
         # Period Loop
         start_p = self.cfg['train_start_period']

@@ -105,6 +105,142 @@ class UserMemoryBank:
 # ===================================================================
 #  Core Component 2: Robust Titans Layer
 # ===================================================================
+class MetaGatedTitansLayer(nn.Module):
+    """
+    Meta-Gated Titans: Self-Referential Memory Update
+    結合了 Feature Modulation (方案A) 與 Adaptive Gating (方案C)
+    """
+    def __init__(self, d_model, dim_feedforward=2048, dropout=0.1):
+        super().__init__()
+        self.d_model = d_model
+        
+        # --- 1. Projections (Titans Core) ---
+        self.proj_q = nn.Linear(d_model, d_model, bias=False)
+        self.proj_k = nn.Linear(d_model, d_model, bias=False)
+        self.proj_v = nn.Linear(d_model, d_model, bias=False)
+        
+        # Base Gates (預設的學習率/遺忘率生成器)
+        self.proj_alpha = nn.Linear(d_model, 1) 
+        self.proj_eta = nn.Linear(d_model, 1)   
+        
+        # --- 2. Meta-Controller (The "Brain") ---
+        # Input: User Static (D) + Memory Context (D) = 2D
+        # Output: 
+        #   - Gamma (D): Feature Scaling
+        #   - Beta (D): Feature Shifting
+        #   - Alpha_bias (1): Forget Gate Bias
+        #   - Eta_bias (1): Input Gate Bias
+        self.meta_controller = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.LayerNorm(d_model), # Normalize for stability
+            nn.ReLU(),
+            nn.Linear(d_model, d_model * 2 + 2) # D(gamma) + D(beta) + 1(alpha) + 1(eta)
+        )
+        
+        # --- 3. Output components ---
+        self.proj_out = nn.Linear(d_model, d_model)
+        
+        # FFN
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.activation = F.relu
+        
+        self.scale = d_model ** -0.5
+
+    def _read_memory(self, query_emb, state):
+        """Helper: 用 Query 去讀取 Memory"""
+        q = self.proj_q(query_emb)
+        q = F.normalize(q, p=2, dim=-1)
+        q_vec = q.unsqueeze(2) # [B, D, 1]
+        read_content = torch.bmm(state, q_vec).squeeze(2) # [B, D]
+        return read_content
+
+    def predict(self, user_static_emb, old_state):
+        """
+        Step 1: Predict (Read Only)
+        與之前相同，使用 User Static + Memory 產生預測特徵
+        """
+        # Pre-Norm
+        x_norm = self.norm1(user_static_emb)
+        
+        # Read from memory
+        read_content = self._read_memory(x_norm, old_state)
+        
+        # Pass through Output Projection & FFN
+        attn_output = self.proj_out(read_content)
+        x = user_static_emb + self.dropout1(attn_output)
+        
+        x2 = self.norm2(x)
+        ffn_out = self.linear2(self.dropout(self.activation(self.linear1(x2))))
+        user_dynamic_emb = x + self.dropout2(ffn_out)
+        
+        return user_dynamic_emb
+
+    def update(self, item_emb, old_state, user_static_emb):
+        """
+        Step 2: Meta-Gated Update (Write)
+        [Change] 新增 user_static_emb 作為 Context 來源
+        """
+        B, D = item_emb.shape
+        
+        # 1. 準備 Meta-Context
+        #    Context = User Static + Current Memory State
+        #    這代表：「我是誰」以及「我現在的狀態」
+        x_static_norm = self.norm1(user_static_emb)
+        memory_context = self._read_memory(x_static_norm, old_state) # [B, D]
+        
+        meta_input = torch.cat([x_static_norm, memory_context], dim=-1) # [B, 2D]
+        
+        # 2. Meta-Controller 生成控制參數
+        meta_out = self.meta_controller(meta_input) # [B, 2D + 2]
+        
+        # Split outputs
+        gamma = meta_out[:, :D]      # [B, D] scaling
+        beta = meta_out[:, D:2*D]    # [B, D] shifting
+        alpha_bias = meta_out[:, -2:-1] # [B, 1]
+        eta_bias = meta_out[:, -1:]     # [B, 1]
+        
+        # 3. Feature Modulation (戴上有色眼鏡)
+        #    item_emb 是原始輸入，我們根據 context 對其進行變形
+        #    使用 1 + tanh(gamma) 確保 scaling 接近 1 且受控，避免爆炸
+        i_norm = self.norm1(item_emb)
+        
+        modulation_scale = 1.0 + torch.tanh(gamma) 
+        modulated_item = i_norm * modulation_scale + beta
+        
+        # 4. Standard Titans Logic with Modulated Input
+        #    注意：K, V 的生成現在基於 "Modulated Item"
+        k = self.proj_k(modulated_item)
+        v = self.proj_v(modulated_item)
+        k = F.normalize(k, p=2, dim=-1)
+        
+        # 5. Adaptive Gating (動態閘門)
+        #    原本的 Gate 是 Linear(item)，現在加上 Meta Bias
+        #    這讓模型可以說：「雖然這個 Item 很普通，但我現在學習慾望很強 (Eta Bias High)」
+        alpha_logits = self.proj_alpha(modulated_item) + alpha_bias
+        eta_logits = self.proj_eta(modulated_item) + eta_bias
+        
+        alpha = torch.sigmoid(alpha_logits) # [B, 1]
+        eta = torch.sigmoid(eta_logits) * self.scale
+        
+        # 6. Memory Update (Delta Rule)
+        k_vec = k.unsqueeze(2)
+        v_vec = v.unsqueeze(2)
+        
+        pred = torch.bmm(old_state, k_vec)
+        error = v_vec - pred
+        
+        alpha_bc = alpha.unsqueeze(2)
+        update_term = torch.bmm(error, k_vec.transpose(1, 2))
+        
+        new_state = (1 - alpha_bc) * old_state + eta.unsqueeze(2) * update_term
+        
+        return new_state
 
 class TitansLayer(nn.Module):
     """
@@ -204,6 +340,59 @@ class TitansLayer(nn.Module):
         new_state = (1 - alpha_bc) * old_state + eta.unsqueeze(2) * update_term
         
         return new_state
+    
+class CMS_ProjectionHead(nn.Module):
+    def __init__(self, input_dim, hidden_dim, dropout=0.1):
+        super().__init__()
+        
+        # [Fast Lane] 快速通道
+        # 特點：淺、神經元少、反應快
+        # 負責：適應 User 最近幾次的點擊 (Short-term context)
+        self.fast_net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, input_dim)
+        )
+        
+        # [Slow Lane] 慢速通道
+        # 特點：深、寬、參數多
+        # 負責：儲存 User 的長期畫像 (Long-term profile)
+        self.slow_net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim), # 多一層，增加容量
+            nn.ReLU(),
+            nn.Linear(hidden_dim, input_dim)
+        )
+
+        # 融合閘門
+        # Input: 原始特徵 x
+        # Output: 0~1 的權重 alpha
+        self.gate = nn.Sequential(
+            nn.Linear(input_dim, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+            nn.Sigmoid()
+        )
+        
+        # 融合層 (簡單相加或透過 Gate 融合)
+        self.out_norm = nn.LayerNorm(input_dim)
+
+    def forward(self, x):
+        fast_out = self.fast_net(x)
+        slow_out = self.slow_net(x)
+        
+        # 殘差連接：原始特徵 + 快速修正 + 長期偏好
+        alpha = self.gate(x) # 決定依賴 Fast 的程度
+        
+        # 軟性切換
+        fused = alpha * fast_out + (1 - alpha) * slow_out
+        
+        return self.out_norm(x + fused)
 
 # ===================================================================
 #  Core Component 3: Standard Transformer (Item Side)
@@ -295,8 +484,8 @@ class DualTowerTitans(nn.Module):
         self._build_encoders()
         
         # 4. Heads
-        self.user_mlp = self._create_mlp(self.user_emb_dim * 2) # Static + Dynamic -> 2x
-        self.item_mlp = self._create_mlp(self.item_emb_dim * 2) # Static + History -> 2x
+        self.user_mlp = self._create_mlp(self.user_emb_dim*2) # Static + Dynamic -> 2x
+        self.item_mlp = self._create_mlp(self.item_emb_dim*2) # Static + History -> 2x
 
         # 5. Negatives Buffer
         self.user_history_buffer = nn.Embedding(self.hparams['n_items'], self.item_emb_dim)
@@ -321,7 +510,7 @@ class DualTowerTitans(nn.Module):
 
     def _build_encoders(self):
         # --- User Tower: One Step Titans ---
-        self.user_titans = TitansLayer(
+        self.user_titans = MetaGatedTitansLayer(
             d_model=self.user_tower_input_dim,
             dim_feedforward=self.user_tower_input_dim * 4,
             dropout=self.hparams.get('transformer_dropout', 0.1)
@@ -338,11 +527,18 @@ class DualTowerTitans(nn.Module):
         ])
 
     def _create_mlp(self, input_dim):
-        return nn.Sequential(
-            nn.LayerNorm(input_dim),
-            nn.Linear(input_dim, input_dim * 2),
-            nn.ReLU(),
-            nn.Linear(input_dim * 2, input_dim) 
+        # return nn.Sequential(
+        #     nn.LayerNorm(input_dim),
+        #     nn.Linear(input_dim, input_dim * 2),
+        #     nn.ReLU(),
+        #     nn.Linear(input_dim * 2, input_dim) 
+        # )
+        
+        # 使用 CMS 替換原本的 MLP
+        return CMS_ProjectionHead(
+            input_dim=input_dim,
+            hidden_dim=input_dim * 2, # 擴展維度
+            dropout=0.1
         )
 
     def _init_weights(self):
@@ -402,7 +598,11 @@ class DualTowerTitans(nn.Module):
         update_input_emb = torch.where(is_cold_start, bos_expanded, prev_item_features)
         
         # C. [Update Step] 用 Prev Item / BOS 更新狀態，得到 Current State (With Grad)
-        current_state = self.user_titans.update(update_input_emb, state_before_prev)
+        current_state = self.user_titans.update(
+            item_emb=update_input_emb, 
+            old_state=state_before_prev,
+            user_static_emb=user_static 
+        )
         
         # D. [Predict Step] 使用 Current State 預測 User Feature
         titans_out = self.user_titans.predict(user_static, current_state)

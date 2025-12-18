@@ -34,7 +34,7 @@ model:
   user_embed_dim: 32
   item_embed_dim: 32
   output_dim: 32
-  cate_embed_dim: 16
+  cate_embed_dim: 32
 
   titans_cpu_offload: false  # Titans CPU Offload 選項
 
