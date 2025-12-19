@@ -5,57 +5,21 @@ import torch.nn.functional as F
 from typing import Dict, Any, Tuple
 import math
 
-import torch
-
-def _debug_check(name: str, x, verbose: bool = False, raise_on_error: bool = False):
-    """
-    簡易的 NaN / Inf 檢查器。
-    - name: 要印出的變數名稱（方便 log）
-    - x: 要檢查的 tensor（或其他型別）
-    - verbose: 若 True，無問題時也會印出 shape/dtype
-    - raise_on_error: 若發現 NaN/Inf，則拋例外以中斷程式（方便追蹤 stack）
-    """
-    if not torch.is_tensor(x):
-        if verbose:
-            print(f"[DEBUG] {name}: not a tensor (type={type(x)})")
-        return
-
-    try:
-        isnan = torch.isnan(x).any().item()
-        isinf = torch.isinf(x).any().item()
-    except Exception as e:
-        print(f"[DEBUG] {name}: error checking isnan/isinf: {e}")
-        return
-
-    if isnan or isinf:
-        info = f"[DEBUG] {name} INVALID -> isnan={isnan}, isinf={isinf}, shape={tuple(x.shape)}, dtype={x.dtype}, device={x.device}"
-        print(info)
-        # 嘗試印出前幾個元素作為 sample（避免大量輸出）
-        try:
-            sample = x.detach().cpu().view(-1)[:16].tolist()
-            print("  sample:", sample)
-        except Exception:
-            pass
-        if raise_on_error:
-            raise RuntimeError(f"{name} contains NaN/Inf")
-    else:
-        if verbose:
-            print(f"[DEBUG] {name}: ok (shape={tuple(x.shape)}, dtype={x.dtype}, device={x.device})")
-
 # ===================================================================
-#  Core Component 1: User Memory Bank (CPU Offload)
+#  Core Component 1: User Memory Bank (CPU Offload Support)
 # ===================================================================
 class UserMemoryBank:
     """
     全域使用者記憶體庫 (Global User Memory Bank)
-    [Update] 支援多維度狀態 (Multi-Head State: N x H x Dh x Dh)
+    儲存每個 User 的 Titans 狀態矩陣 S。
+    Shape: [N_USERS, N_HEADS, HEAD_DIM, HEAD_DIM]
     """
     def __init__(self, n_users: int, state_shape: Tuple[int, ...], enable_cpu_offload: bool = False):
         self.n_users = n_users
         self.state_shape = state_shape # e.g., (4, 8, 8) for H=4, Dh=8
         self.enable_cpu_offload = enable_cpu_offload
         
-        # 計算總元素數量
+        # 計算記憶體佔用量並印出資訊
         state_numel = math.prod(state_shape)
         mem_size_gb = (n_users * state_numel * 4) / (1024**3)
         
@@ -66,9 +30,9 @@ class UserMemoryBank:
         print(f"--- [MemoryBank] Allocating {n_users}x{state_shape} state on {location} ---")
         print(f"--- [MemoryBank] Estimated Size: {mem_size_gb:.2f} GB ---")
         
-        # 完整 shape: [N_USERS, H, Dh, Dh]
         full_shape = (n_users,) + state_shape
         
+        # 初始化全零狀態
         if enable_cpu_offload:
             self.states = torch.zeros(full_shape, dtype=torch.float32, pin_memory=True)
         else:
@@ -76,6 +40,7 @@ class UserMemoryBank:
             self.states = torch.zeros(full_shape, dtype=torch.float32, device=device)
         
     def get_batch_states(self, user_ids: torch.Tensor, target_device: torch.device = None) -> torch.Tensor:
+        """從 Bank 讀取狀態 (Read)"""
         if self.enable_cpu_offload:
             ids_cpu = user_ids.cpu()
             batch_states = self.states.index_select(0, ids_cpu)
@@ -84,6 +49,7 @@ class UserMemoryBank:
             return self.states.index_select(0, user_ids)
     
     def update_batch_states(self, user_ids: torch.Tensor, new_states: torch.Tensor):
+        """將新狀態寫回 Bank (Write)，注意這裡會 Detach 截斷梯度"""
         new_states_detached = new_states.detach()
         if self.enable_cpu_offload:
             ids_cpu = user_ids.cpu()
@@ -93,14 +59,15 @@ class UserMemoryBank:
             self.states.index_copy_(0, user_ids, new_states_detached)
 
 # ===================================================================
-#  Core Component 2: Robust Titans Layer
+#  Core Component 2: Multi-Head Meta-Gated Titans Layer
 # ===================================================================
-
 class MultiHeadMetaGatedTitansLayer(nn.Module):
     """
-    Multi-Head Meta-Gated Titans
-    - H 個獨立的 Memory Heads
-    - 共享的 Meta-Controller 產生每個 Head 的調變參數
+    Multi-Head Meta-Gated Titans (The Core Engine)
+    特點：
+    1. Multi-Head: 平行處理多個子空間的記憶。
+    2. Meta-Gated: 使用 Meta-Controller 動態生成 scaling/shifting/gating 參數。
+    3. Self-Referential: 更新規則取決於 (User Static + Current Memory)。
     """
     def __init__(self, d_model, n_heads=4, dim_feedforward=2048, dropout=0.1):
         super().__init__()
@@ -110,24 +77,18 @@ class MultiHeadMetaGatedTitansLayer(nn.Module):
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
         
-        # --- 1. Projections (All Heads together) ---
-        # Q, K, V 投影後會被切分成 H 份
+        # --- 1. Projections (Q, K, V) ---
         self.proj_q = nn.Linear(d_model, d_model, bias=False)
         self.proj_k = nn.Linear(d_model, d_model, bias=False)
         self.proj_v = nn.Linear(d_model, d_model, bias=False)
         
-        # Base Gates (預設值)
-        # 這裡我們讓每個 Head 有自己獨立的 bias
+        # Base Gate Biases (Per Head)
         self.proj_alpha = nn.Linear(d_model, n_heads) 
         self.proj_eta = nn.Linear(d_model, n_heads)   
         
-        # --- 2. Meta-Controller ---
+        # --- 2. Meta-Controller (小腦) ---
         # Input: User Static (D) + Memory Context (D) = 2D
-        # Output: 
-        #   - Gamma (D): Feature Scaling (Per Dimension)
-        #   - Beta (D): Feature Shifting (Per Dimension)
-        #   - Alpha_bias (H): Forget Gate Bias (Per Head)
-        #   - Eta_bias (H): Input Gate Bias (Per Head)
+        # Output: Gamma(D) + Beta(D) + Alpha_bias(H) + Eta_bias(H)
         self.meta_controller = nn.Sequential(
             nn.Linear(d_model * 2, d_model),
             nn.LayerNorm(d_model),
@@ -138,7 +99,7 @@ class MultiHeadMetaGatedTitansLayer(nn.Module):
         # --- 3. Output Fusion ---
         self.proj_out = nn.Linear(d_model, d_model)
         
-        # FFN
+        # FFN Block
         self.linear1 = nn.Linear(d_model, dim_feedforward)
         self.dropout = nn.Dropout(dropout)
         self.linear2 = nn.Linear(dim_feedforward, d_model)
@@ -152,30 +113,27 @@ class MultiHeadMetaGatedTitansLayer(nn.Module):
         self.scale = self.head_dim ** -0.5
 
     def _read_memory(self, query_emb, state):
-        """
-        Multi-Head Memory Read
-        query_emb: [B, D] -> reshape to [B, H, Dh]
-        state: [B, H, Dh, Dh]
-        """
+        """Helper: 用 Query 讀取多頭記憶體"""
         B = query_emb.size(0)
         
-        # Project & Reshape Q
-        q = self.proj_q(query_emb) # [B, D]
-        q = q.view(B, self.n_heads, self.head_dim) # [B, H, Dh]
+        # Project & Reshape Q -> [B, H, Dh]
+        q = self.proj_q(query_emb)
+        q = q.view(B, self.n_heads, self.head_dim)
         q = F.normalize(q, p=2, dim=-1)
         
-        # Read: y_h = S_h * q_h
+        # Read: y = S * q
         # [B, H, Dh, Dh] @ [B, H, Dh, 1] -> [B, H, Dh, 1]
         q_vec = q.unsqueeze(-1)
-        read_content = torch.matmul(state, q_vec).squeeze(-1) # [B, H, Dh]
+        read_content = torch.matmul(state, q_vec).squeeze(-1) 
         
         # Flatten back to [B, D]
         return read_content.view(B, self.d_model)
 
     def predict(self, user_static_emb, old_state):
+        """Step 1: Predict (Read Only)"""
         x_norm = self.norm1(user_static_emb)
         
-        # Read from multi-head memory
+        # Retrieval
         read_content = self._read_memory(x_norm, old_state)
         
         # Fusion & FFN
@@ -189,308 +147,68 @@ class MultiHeadMetaGatedTitansLayer(nn.Module):
         return user_dynamic_emb
 
     def update(self, item_emb, old_state, user_static_emb):
-        """
-        Multi-Head Meta-Gated Update
-        item_emb: [B, D]
-        old_state: [B, H, Dh, Dh]
-        """
+        """Step 2: Update (Write) with Meta-Gating"""
         B, D = item_emb.shape
         H, Dh = self.n_heads, self.head_dim
         
-        # 1. Meta-Context Preparation
+        # 1. Meta-Context: 結合 User 本質與當下記憶
         x_static_norm = self.norm1(user_static_emb)
-        memory_context = self._read_memory(x_static_norm, old_state) # [B, D]
-        
+        memory_context = self._read_memory(x_static_norm, old_state)
         meta_input = torch.cat([x_static_norm, memory_context], dim=-1) # [B, 2D]
         
-        # 2. Meta-Controller Output
-        meta_out = self.meta_controller(meta_input) # [B, 2D + 2H]
+        # 2. Meta-Controller 生成參數
+        meta_out = self.meta_controller(meta_input)
         
-        # Split outputs
-        gamma = meta_out[:, :D]        # [B, D]
-        beta = meta_out[:, D:2*D]      # [B, D]
-        alpha_bias = meta_out[:, 2*D:2*D+H] # [B, H]
-        eta_bias = meta_out[:, -H:]         # [B, H]
+        gamma = meta_out[:, :D]        # Feature Scaling
+        beta = meta_out[:, D:2*D]      # Feature Shifting
+        alpha_bias = meta_out[:, 2*D:2*D+H] # Forget Gate Bias
+        eta_bias = meta_out[:, -H:]         # Input Gate Bias
         
-        # 3. Feature Modulation (on flattened D)
+        # 3. Feature Modulation (特徵調變)
         i_norm = self.norm1(item_emb)
         modulation_scale = 1.0 + torch.tanh(gamma)
         modulated_item = i_norm * modulation_scale + beta
         
-        # 4. Multi-Head Projections
+        # 4. Projections
         k = self.proj_k(modulated_item).view(B, H, Dh)
         v = self.proj_v(modulated_item).view(B, H, Dh)
-        k = F.normalize(k, p=2, dim=-1) # L2 Norm per head
+        k = F.normalize(k, p=2, dim=-1)
         
         # 5. Adaptive Gating (Per Head)
-        # alpha_logits: [B, H]
         alpha_logits = self.proj_alpha(modulated_item) + alpha_bias
         eta_logits = self.proj_eta(modulated_item) + eta_bias
         
-        alpha = torch.sigmoid(alpha_logits).view(B, H, 1, 1) # Broadcastable
+        alpha = torch.sigmoid(alpha_logits).view(B, H, 1, 1)
         eta = (torch.sigmoid(eta_logits) * self.scale).view(B, H, 1, 1)
         
-        # 6. Memory Update (Per Head Parallel)
-        # k: [B, H, Dh] -> [B, H, Dh, 1]
+        # 6. Memory Update (Delta Rule)
         k_vec = k.unsqueeze(-1)
         v_vec = v.unsqueeze(-1)
         
-        # Pred: [B, H, Dh, Dh] @ [B, H, Dh, 1] -> [B, H, Dh, 1]
+        # Reconstruction: v_hat = S * k
         pred = torch.matmul(old_state, k_vec)
         error = v_vec - pred
         
-        # Update: error @ k.T -> [B, H, Dh, 1] @ [B, H, 1, Dh] -> [B, H, Dh, Dh]
+        # Update Term: error * k.T
         update_term = torch.matmul(error, k_vec.transpose(-1, -2))
         
-        # Delta Rule
+        # New State
         new_state = (1 - alpha) * old_state + eta * update_term
         
         return new_state
-    
 
-class MetaGatedTitansLayer(nn.Module):
-    """
-    Meta-Gated Titans: Self-Referential Memory Update
-    結合了 Feature Modulation (方案A) 與 Adaptive Gating (方案C)
-    """
-    def __init__(self, d_model, dim_feedforward=2048, dropout=0.1):
-        super().__init__()
-        self.d_model = d_model
-        
-        # --- 1. Projections (Titans Core) ---
-        self.proj_q = nn.Linear(d_model, d_model, bias=False)
-        self.proj_k = nn.Linear(d_model, d_model, bias=False)
-        self.proj_v = nn.Linear(d_model, d_model, bias=False)
-        
-        # Base Gates (預設的學習率/遺忘率生成器)
-        self.proj_alpha = nn.Linear(d_model, 1) 
-        self.proj_eta = nn.Linear(d_model, 1)   
-        
-        # --- 2. Meta-Controller (The "Brain") ---
-        # Input: User Static (D) + Memory Context (D) = 2D
-        # Output: 
-        #   - Gamma (D): Feature Scaling
-        #   - Beta (D): Feature Shifting
-        #   - Alpha_bias (1): Forget Gate Bias
-        #   - Eta_bias (1): Input Gate Bias
-        self.meta_controller = nn.Sequential(
-            nn.Linear(d_model * 2, d_model),
-            nn.LayerNorm(d_model), # Normalize for stability
-            nn.ReLU(),
-            nn.Linear(d_model, d_model * 2 + 2) # D(gamma) + D(beta) + 1(alpha) + 1(eta)
-        )
-        
-        # --- 3. Output components ---
-        self.proj_out = nn.Linear(d_model, d_model)
-        
-        # FFN
-        self.linear1 = nn.Linear(d_model, dim_feedforward)
-        self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(dim_feedforward, d_model)
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.dropout1 = nn.Dropout(dropout)
-        self.dropout2 = nn.Dropout(dropout)
-        self.activation = F.relu
-        
-        self.scale = d_model ** -0.5
-
-    def _read_memory(self, query_emb, state):
-        """Helper: 用 Query 去讀取 Memory"""
-        q = self.proj_q(query_emb)
-        q = F.normalize(q, p=2, dim=-1)
-        q_vec = q.unsqueeze(2) # [B, D, 1]
-        read_content = torch.bmm(state, q_vec).squeeze(2) # [B, D]
-        return read_content
-
-    def predict(self, user_static_emb, old_state):
-        """
-        Step 1: Predict (Read Only)
-        與之前相同，使用 User Static + Memory 產生預測特徵
-        """
-        # Pre-Norm
-        x_norm = self.norm1(user_static_emb)
-        
-        # Read from memory
-        read_content = self._read_memory(x_norm, old_state)
-        
-        # Pass through Output Projection & FFN
-        attn_output = self.proj_out(read_content)
-        x = user_static_emb + self.dropout1(attn_output)
-        
-        x2 = self.norm2(x)
-        ffn_out = self.linear2(self.dropout(self.activation(self.linear1(x2))))
-        user_dynamic_emb = x + self.dropout2(ffn_out)
-        
-        return user_dynamic_emb
-
-    def update(self, item_emb, old_state, user_static_emb):
-        """
-        Step 2: Meta-Gated Update (Write)
-        [Change] 新增 user_static_emb 作為 Context 來源
-        """
-        B, D = item_emb.shape
-        
-        # 1. 準備 Meta-Context
-        #    Context = User Static + Current Memory State
-        #    這代表：「我是誰」以及「我現在的狀態」
-        x_static_norm = self.norm1(user_static_emb)
-        memory_context = self._read_memory(x_static_norm, old_state) # [B, D]
-        
-        meta_input = torch.cat([x_static_norm, memory_context], dim=-1) # [B, 2D]
-        
-        # 2. Meta-Controller 生成控制參數
-        meta_out = self.meta_controller(meta_input) # [B, 2D + 2]
-        
-        # Split outputs
-        gamma = meta_out[:, :D]      # [B, D] scaling
-        beta = meta_out[:, D:2*D]    # [B, D] shifting
-        alpha_bias = meta_out[:, -2:-1] # [B, 1]
-        eta_bias = meta_out[:, -1:]     # [B, 1]
-        
-        # 3. Feature Modulation (戴上有色眼鏡)
-        #    item_emb 是原始輸入，我們根據 context 對其進行變形
-        #    使用 1 + tanh(gamma) 確保 scaling 接近 1 且受控，避免爆炸
-        i_norm = self.norm1(item_emb)
-        
-        modulation_scale = 1.0 + torch.tanh(gamma) 
-        modulated_item = i_norm * modulation_scale + beta
-        
-        # 4. Standard Titans Logic with Modulated Input
-        #    注意：K, V 的生成現在基於 "Modulated Item"
-        k = self.proj_k(modulated_item)
-        v = self.proj_v(modulated_item)
-        k = F.normalize(k, p=2, dim=-1)
-        
-        # 5. Adaptive Gating (動態閘門)
-        #    原本的 Gate 是 Linear(item)，現在加上 Meta Bias
-        #    這讓模型可以說：「雖然這個 Item 很普通，但我現在學習慾望很強 (Eta Bias High)」
-        alpha_logits = self.proj_alpha(modulated_item) + alpha_bias
-        eta_logits = self.proj_eta(modulated_item) + eta_bias
-        
-        alpha = torch.sigmoid(alpha_logits) # [B, 1]
-        eta = torch.sigmoid(eta_logits) * self.scale
-        
-        # 6. Memory Update (Delta Rule)
-        k_vec = k.unsqueeze(2)
-        v_vec = v.unsqueeze(2)
-        
-        pred = torch.bmm(old_state, k_vec)
-        error = v_vec - pred
-        
-        alpha_bc = alpha.unsqueeze(2)
-        update_term = torch.bmm(error, k_vec.transpose(1, 2))
-        
-        new_state = (1 - alpha_bc) * old_state + eta.unsqueeze(2) * update_term
-        
-        return new_state
-
-class TitansLayer(nn.Module):
-    """
-    Titans: Linear Memory with Delta Rule (Robust Version)
-    """
-    def __init__(self, d_model, dim_feedforward=2048, dropout=0.1):
-        super().__init__()
-        self.d_model = d_model
-        
-        # Projections
-        # Q 用於 Predict (來源是 User Static)
-        self.proj_q = nn.Linear(d_model, d_model, bias=False)
-        
-        # K, V, Gates 用於 Update (來源是 Item)
-        self.proj_k = nn.Linear(d_model, d_model, bias=False)
-        self.proj_v = nn.Linear(d_model, d_model, bias=False)
-        self.proj_alpha = nn.Linear(d_model, 1) 
-        self.proj_eta = nn.Linear(d_model, 1)   
-        
-        # Output components
-        self.proj_out = nn.Linear(d_model, d_model)
-        
-        # FFN
-        self.linear1 = nn.Linear(d_model, dim_feedforward)
-        self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(dim_feedforward, d_model)
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.dropout1 = nn.Dropout(dropout)
-        self.dropout2 = nn.Dropout(dropout)
-        self.activation = F.relu
-        
-        self.scale = d_model ** -0.5
-
-    def predict(self, user_static_emb, old_state):
-        """
-        Step 1: 預測 (Read). 使用 User Static Feature 去查詢 Memory
-        user_static_emb: [B, D]
-        old_state: [B, D, D]
-        Return: user_dynamic_emb [B, D]
-        """
-        # Pre-Norm
-        x_norm = self.norm1(user_static_emb)
-        
-        # Generate Query
-        q = self.proj_q(x_norm) # [B, D]
-        q = F.normalize(q, p=2, dim=-1)
-        q_vec = q.unsqueeze(2) # [B, D, 1]
-        
-        # Retrieval: y = S_{t-1} * q
-        # 這是 User 結合了歷史記憶後的當下狀態
-        read_content = torch.bmm(old_state, q_vec).squeeze(2) # [B, D]
-        
-        # Pass through Output Projection & FFN
-        attn_output = self.proj_out(read_content)
-        x = user_static_emb + self.dropout1(attn_output) # Residual with input
-        
-        x2 = self.norm2(x)
-        ffn_out = self.linear2(self.dropout(self.activation(self.linear1(x2))))
-        user_dynamic_emb = x + self.dropout2(ffn_out)
-        
-        return user_dynamic_emb
-
-    def update(self, item_emb, old_state):
-        """
-        Step 2: 更新 (Write). 使用 Item 去更新 Memory
-        item_emb: [B, D] - 當前互動的 Item (Target)
-        old_state: [B, D, D]
-        Return: new_state [B, D, D]
-        """
-        # Pre-Norm Item
-        i_norm = self.norm1(item_emb)
-        
-        # Generate K, V, Gates from Item
-        k = self.proj_k(i_norm)
-        v = self.proj_v(i_norm)
-        k = F.normalize(k, p=2, dim=-1)
-        
-        alpha = torch.sigmoid(self.proj_alpha(i_norm)) # [B, 1]
-        eta = torch.sigmoid(self.proj_eta(i_norm)) * self.scale
-        
-        # Reshape
-        k_vec = k.unsqueeze(2) # [B, D, 1]
-        v_vec = v.unsqueeze(2) # [B, D, 1]
-        
-        # Memory Update (Delta Rule)
-        # 1. Reconstruction: v_hat = S * k
-        pred = torch.bmm(old_state, k_vec)
-        
-        # 2. Surprise: e = v - v_hat
-        error = v_vec - pred
-        
-        # 3. Update: S_new = (1-a)S + eta * (e * k^T)
-        alpha_bc = alpha.unsqueeze(2)
-        update_term = torch.bmm(error, k_vec.transpose(1, 2))
-        
-        new_state = (1 - alpha_bc) * old_state + eta.unsqueeze(2) * update_term
-        
-        return new_state
-    
+# ===================================================================
+#  Core Component 3: CMS Projection Head (For User Tower)
+# ===================================================================
 class CMS_ProjectionHead(nn.Module):
+    """
+    Continuum Memory System (Gated)
+    包含 Fast Lane (短期適應) 與 Slow Lane (長期記憶)。
+    """
     def __init__(self, input_dim, hidden_dim, dropout=0.1):
         super().__init__()
         
-        # [Fast Lane] 快速通道
-        # 特點：淺、神經元少、反應快
-        # 負責：適應 User 最近幾次的點擊 (Short-term context)
+        # [Fast Lane] 淺層、快速適應
         self.fast_net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim // 2),
             nn.LayerNorm(hidden_dim // 2),
@@ -499,22 +217,18 @@ class CMS_ProjectionHead(nn.Module):
             nn.Linear(hidden_dim // 2, input_dim)
         )
         
-        # [Slow Lane] 慢速通道
-        # 特點：深、寬、參數多
-        # 負責：儲存 User 的長期畫像 (Long-term profile)
+        # [Slow Lane] 深層、長期記憶 (需配合 Optimizer 低 LR)
         self.slow_net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim), # 多一層，增加容量
+            nn.Linear(hidden_dim, hidden_dim), 
             nn.ReLU(),
             nn.Linear(hidden_dim, input_dim)
         )
 
-        # 融合閘門
-        # Input: 原始特徵 x
-        # Output: 0~1 的權重 alpha
+        # Gating 機制：決定依賴短期還是長期
         self.gate = nn.Sequential(
             nn.Linear(input_dim, 32),
             nn.ReLU(),
@@ -522,26 +236,24 @@ class CMS_ProjectionHead(nn.Module):
             nn.Sigmoid()
         )
         
-        # 融合層 (簡單相加或透過 Gate 融合)
         self.out_norm = nn.LayerNorm(input_dim)
 
     def forward(self, x):
         fast_out = self.fast_net(x)
         slow_out = self.slow_net(x)
         
-        # 殘差連接：原始特徵 + 快速修正 + 長期偏好
-        alpha = self.gate(x) # 決定依賴 Fast 的程度
-        
-        # 軟性切換
+        alpha = self.gate(x)
         fused = alpha * fast_out + (1 - alpha) * slow_out
         
         return self.out_norm(x + fused)
 
 # ===================================================================
-#  Core Component 3: Standard Transformer (Item Side)
+#  Core Component 4: Standard Transformer (For Item Tower)
 # ===================================================================
-
 class StandardTransformerLayer(nn.Module):
+    """
+    標準 Transformer Encoder Layer (用於捕捉 Item History 的共現關係)
+    """
     def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1):
         super().__init__()
         self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
@@ -589,7 +301,6 @@ def average_pooling(embeddings: torch.Tensor, seq_lens: torch.Tensor) -> torch.T
 # ===================================================================
 #  Main Model: DualTowerTitans
 # ===================================================================
-
 class DualTowerTitans(nn.Module):
     def __init__(self, global_meta: Dict[str, Any], cfg: Dict[str, Any]):
         super().__init__()
@@ -608,38 +319,34 @@ class DualTowerTitans(nn.Module):
         self.item_emb_dim = self.embed_dim
         self.cate_emb_dim = self.embed_dim 
         
-        # Tower Input Dimensions
         self.user_tower_input_dim = self.embed_dim 
         self.item_tower_input_dim = self.embed_dim
 
-        # [Config] 設定 Head 數量，預設為 4
+        # [Config] 設定 Head 數量 (建議 4)
         self.n_heads = self.hparams.get('titans_n_heads', 4)
         self.head_dim = self.user_tower_input_dim // self.n_heads
         
-        # 確保整除
         assert self.user_tower_input_dim % self.n_heads == 0, \
             f"Embed dim {self.user_tower_input_dim} not divisible by n_heads {self.n_heads}"
         
-        # 1. Embeddings
+        # 1. Embeddings (加上 padding_idx=0 安全網)
         self._build_embeddings()
         
-        # 2. Titans Memory Bank 
-        # State Shape: (H, Dh, Dh)
+        # 2. Titans Memory Bank (Multi-Head Shape)
         state_shape = (self.n_heads, self.head_dim, self.head_dim)
-        
         enable_cpu_offload = self.hparams.get('titans_cpu_offload', False)
         self.user_memory_bank = UserMemoryBank(
             n_users=self.hparams['n_users'], 
-            state_shape=state_shape, # 傳入 Tuple
+            state_shape=state_shape,
             enable_cpu_offload=enable_cpu_offload
         )
         
-        # 3. Encoders (Titans & Transformer)
+        # 3. Encoders
         self._build_encoders()
         
-        # 4. Heads
-        self.user_mlp = self._create_mlp(self.user_emb_dim*2) # Static + Dynamic -> 2x
-        self.item_mlp = self._create_mlp(self.item_emb_dim*2) # Static + History -> 2x
+        # 4. Heads (分離設計：User 用 CMS, Item 用 Standard MLP)
+        self.user_mlp = self._create_mlp(self.user_emb_dim*2)
+        self.item_mlp = self._create_mlp(self.item_emb_dim*2)
 
         # 5. Negatives Buffer
         self.user_history_buffer = nn.Embedding(self.hparams['n_items'], self.item_emb_dim)
@@ -648,6 +355,7 @@ class DualTowerTitans(nn.Module):
         self._init_weights()
 
     def _build_embeddings(self):
+        # 統一使用 padding_idx=0，前處理需對應 shift
         self.user_emb_w = nn.Embedding(self.hparams['n_users'], self.user_emb_dim, padding_idx=0)
         self.item_emb_w = nn.Embedding(self.hparams['n_items'], self.item_emb_dim, padding_idx=0) 
         self.cate_emb_w = nn.Embedding(self.hparams['n_cates'], self.cate_emb_dim, padding_idx=0)
@@ -655,46 +363,36 @@ class DualTowerTitans(nn.Module):
         # Positional Embedding (只給 Item Tower 的 Transformer 用)
         self.item_tower_pos_emb = nn.Embedding(self.maxlen, self.item_tower_input_dim)
 
-        # [新增] Learnable BOS Token (Beginning of Sequence)
-        # 當 User 沒有任何歷史 (interacted_len == 0) 時，用這個向量來更新初始狀態
+        # Learnable BOS Token (冷啟動專用)
         self.bos_item_emb = nn.Parameter(torch.randn(1, self.item_emb_dim))
-    
-        # 初始化權重
         nn.init.normal_(self.bos_item_emb, mean=0, std=0.02)
 
     def _build_encoders(self):
-        # --- User Tower: One Step Titans ---
+        # --- User Tower: Multi-Head Meta-Gated Titans ---
         self.user_titans = MultiHeadMetaGatedTitansLayer(
             d_model=self.user_tower_input_dim,
-            n_heads=self.n_heads, # 傳入 head 數
+            n_heads=self.n_heads,
             dim_feedforward=self.user_tower_input_dim * 4,
             dropout=self.hparams.get('transformer_dropout', 0.1)
         )
         
-        # --- Item Tower: Transformer (Standard SASRec) ---
+        # --- Item Tower: 1-Layer Transformer ---
         self.item_transformer = nn.ModuleList([
             StandardTransformerLayer(
                 d_model=self.item_tower_input_dim, 
                 nhead=4,
                 dim_feedforward=self.item_tower_input_dim * 4,
                 dropout=0.1
-            ) for _ in range(self.hparams.get('transformer_n_layers', 2))
+            ) for _ in range(self.hparams.get('transformer_n_layers', 1)) # Default 1 layer
         ])
 
     def _create_mlp(self, input_dim):
-        # return nn.Sequential(
-        #     nn.LayerNorm(input_dim),
-        #     nn.Linear(input_dim, input_dim * 2),
-        #     nn.ReLU(),
-        #     nn.Linear(input_dim * 2, input_dim) 
-        # )
-        
-        # 使用 CMS 替換原本的 MLP
         return CMS_ProjectionHead(
             input_dim=input_dim,
-            hidden_dim=input_dim * 2, # 擴展維度
+            hidden_dim=input_dim * 2, 
             dropout=0.1
-        )
+            )
+            
 
     def _init_weights(self):
         for m in self.modules():
@@ -707,17 +405,13 @@ class DualTowerTitans(nn.Module):
     # ===================================================================
     #  Forward Logic
     # ===================================================================
-
     def _lookup_item_features(self, item_ids: torch.Tensor) -> torch.Tensor:
-        # 1. Item ID Embedding
-        static_emb = self.item_emb_w(item_ids) # [B, D]
-        
-        # 2. Category Embedding (Average Pooling)
+        # Additive Feature Fusion: ID + Category
+        static_emb = self.item_emb_w(item_ids) 
         item_cates = self.cates[item_ids]
         item_cates_emb = self.cate_emb_w(item_cates)
-        avg_cate_emb = average_pooling(item_cates_emb, self.cate_lens[item_ids]) # [B, D]
+        avg_cate_emb = average_pooling(item_cates_emb, self.cate_lens[item_ids]) 
         
-        # 相加模式 (Additive)
         return static_emb + avg_cate_emb
 
     def _build_feature_representations(self, batch: Dict) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -725,76 +419,63 @@ class DualTowerTitans(nn.Module):
         # ---------------------------------------------------
         # 1. User Tower (Titans - Stateful)
         # ---------------------------------------------------
-        user_static = self.user_emb_w(batch['user_id']) # [B, D]
+        user_static = self.user_emb_w(batch['user_id']) 
         
-        # A. 從 Memory Bank 讀取 Old State (Detached)
+        # A. Read Old State
         state_before_prev = self.user_memory_bank.get_batch_states(batch['user_id'], user_static.device)
         
-        # B. [動態提取] 準備 Prev Item Features (用於更新狀態)
-        # 1. 取得歷史序列與長度
-        hist_seq = batch['user_interacted_items'] # [B, MaxLen]
-        hist_len = batch['user_interacted_len']   # [B]
+        # B. Prepare Prev Item / Cold Start Handling
+        hist_seq = batch['user_interacted_items'] 
+        hist_len = batch['user_interacted_len']   
         B = hist_len.size(0)
 
-        # 2. 計算最後一個有效 Item 的 Index (Clamp to 0 to avoid error, masked later)
         last_item_idx = (hist_len - 1).clamp(min=0).unsqueeze(1)
-        
-        # 3. Gather Prev Item ID
         prev_item_ids = hist_seq.gather(1, last_item_idx).squeeze(1)
+        prev_item_features = self._lookup_item_features(prev_item_ids) 
         
-        # 4. Lookup Features (No Detach! We want gradient to flow here)
-        prev_item_features = self._lookup_item_features(prev_item_ids) # [B, D]
-        
-        # 5. Cold Start Mask (Len == 0) -> Use BOS
-        is_cold_start = (hist_len == 0).unsqueeze(1) # [B, 1]
+        # Cold Start: If len=0, use BOS token
+        is_cold_start = (hist_len == 0).unsqueeze(1) 
         bos_expanded = self.bos_item_emb.expand(B, -1)
-        
-        # 混合 Input: 冷啟動用 BOS，否則用上一個 Item
         update_input_emb = torch.where(is_cold_start, bos_expanded, prev_item_features)
         
-        # C. [Update Step] 用 Prev Item / BOS 更新狀態，得到 Current State (With Grad)
+        # C. Update State (Gradient flows through user_titans)
         current_state = self.user_titans.update(
             item_emb=update_input_emb, 
             old_state=state_before_prev,
             user_static_emb=user_static 
         )
         
-        # D. [Predict Step] 使用 Current State 預測 User Feature
+        # D. Predict
         titans_out = self.user_titans.predict(user_static, current_state)
-        
-        # Concat [B, 2D]
         user_features = torch.cat([user_static, titans_out], dim=-1)
 
-        # [State Update] 只在訓練時更新 Memory Bank (Inference 時不更新，避免污染)
+        # [State Update] Only during training
         if self.training:
             self.user_memory_bank.update_batch_states(batch['user_id'], current_state)
             
         # ---------------------------------------------------
         # 2. Item Tower (Transformer - Stateless)
         # ---------------------------------------------------
-        item_composite_static = self._lookup_item_features(batch['item_id']) # [B, D]
+        item_composite_static = self._lookup_item_features(batch['item_id'])
         B_item, _ = item_composite_static.shape
         
-        # Input: Item Sequence
         item_hist_user_ids = batch['item_interacted_users']
-        item_hist_emb = self.user_emb_w(item_hist_user_ids).detach() # [B, T, D]
+        item_hist_emb = self.user_emb_w(item_hist_user_ids).detach()
         seq_len_i = batch['item_interacted_len']
         
-        # Add Positional Embedding
+        # Positional Embedding (Optional but kept for Transformer)
         pos_ids = torch.arange(item_hist_emb.size(1), device=item_hist_emb.device)
         item_seq_input = item_hist_emb + self.item_tower_pos_emb(pos_ids).unsqueeze(0)
         
-        # Masks (Causal + Padding)
-        src_mask = nn.Transformer.generate_square_subsequent_mask(item_hist_emb.size(1), device=item_hist_emb.device).bool()
+        # Padding Mask
         safe_lens_i = torch.clamp(seq_len_i, min=1)
         padding_mask_i = (torch.arange(item_hist_emb.size(1), device=item_hist_emb.device)[None, :] >= safe_lens_i[:, None])
         
-        # Transformer Forward
         output = item_seq_input
         for layer in self.item_transformer:
-            output = layer(output, src_mask=src_mask, src_key_padding_mask=padding_mask_i)
+            output = layer(output, src_mask=None, src_key_padding_mask=padding_mask_i)
             
-        # Pooling (Last)
+        # Pooling: Last Valid Token
         target_indices_i = (seq_len_i - 1).clamp(min=0).view(B_item, 1, 1).expand(-1, 1, self.item_tower_input_dim)
         item_history_emb = torch.gather(output, 1, target_indices_i).squeeze(1)
         
@@ -809,6 +490,7 @@ class DualTowerTitans(nn.Module):
     def forward(self, batch: Dict) -> Tuple[torch.Tensor, torch.Tensor]:
         user_features, item_features = self._build_feature_representations(batch)
         
+        # Normalize with eps for stability
         user_embedding = F.normalize(self.user_mlp(user_features), p=2, dim=-1, eps=1e-6)
         item_embedding = F.normalize(self.item_mlp(item_features), p=2, dim=-1, eps=1e-6)
         
@@ -817,6 +499,8 @@ class DualTowerTitans(nn.Module):
     def _calculate_infonce_loss(self, user_embedding, item_embedding, labels):
         all_inner_product = torch.matmul(user_embedding, item_embedding.t())
         logits = all_inner_product / self.temperature
+        
+        # Stable Softmax
         logits_max, _ = torch.max(logits, dim=1, keepdim=True)
         logits_stabilized = logits - logits_max
         exp_logits_den = torch.exp(logits_stabilized)
@@ -838,42 +522,33 @@ class DualTowerTitans(nn.Module):
         return loss_infonce.mean()
 
     def inference(self, batch: Dict[str, torch.Tensor], neg_item_ids_batch: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # 1. 取得 User Features (training=False, 不會更新 Memory)
         user_features, item_features = self._build_feature_representations(batch)
         
-        # 2. Positive Scores
-        pos_user_emb = F.normalize(self.user_mlp(user_features), p=2, dim=-1)
-        pos_item_emb = F.normalize(self.item_mlp(item_features), p=2, dim=-1)
+        pos_user_emb = F.normalize(self.user_mlp(user_features), p=2, dim=-1, eps=1e-6)
+        pos_item_emb = F.normalize(self.item_mlp(item_features), p=2, dim=-1, eps=1e-6)
         
         pos_logits = torch.sum(pos_user_emb * pos_item_emb, dim=1)
         per_sample_loss = F.binary_cross_entropy_with_logits(pos_logits, batch['labels'].float(), reduction='none')
 
-        # 3. Negative Samples Handling
+        # Negative Samples
         num_neg_samples = neg_item_ids_batch.shape[1]
         
-        # A. 負樣本 Static (ID + Cate)
         neg_item_static_emb = self.item_emb_w(neg_item_ids_batch) 
         neg_item_cate_emb = self.cate_emb_w(self.cates[neg_item_ids_batch])
         neg_item_cates_len = self.cate_lens[neg_item_ids_batch]
         avg_cate_emb_for_neg_item = average_pooling(neg_item_cate_emb, neg_item_cates_len) 
         
-        # 相加模式 (Additive)
         neg_item_emb_with_cate = neg_item_static_emb + avg_cate_emb_for_neg_item 
         
-        # B. 負樣本 History (從 Buffer 讀取)
         item_history_emb_expanded = self.user_history_buffer(neg_item_ids_batch)
-        
-        # C. 組合 (Concat)
         neg_item_features = torch.cat([neg_item_emb_with_cate, item_history_emb_expanded.detach()], dim=2)
         
-        # D. User Feature 擴展
         user_features_expanded = user_features.unsqueeze(1).expand(-1, num_neg_samples, -1)
         
-        # E. MLP Projection
+        # Use user_mlp and item_mlp accordingly
         neg_user_emb = self.user_mlp(user_features_expanded)
         neg_item_emb = self.item_mlp(neg_item_features)
         
-        # [修正] 補上 eps=1e-6
         neg_user_emb_final = F.normalize(neg_user_emb, p=2, dim=-1, eps=1e-6)
         neg_item_emb_final = F.normalize(neg_item_emb, p=2, dim=-1, eps=1e-6)
         

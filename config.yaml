@@ -31,10 +31,10 @@ model_type: 'dual_tower_titans'
 model:
   batch_size: 1024
   text_embed_dim: 384
-  user_embed_dim: 32
-  item_embed_dim: 32
-  output_dim: 32
-  cate_embed_dim: 32
+  user_embed_dim: 128
+  item_embed_dim: 128
+  output_dim: 128
+  cate_embed_dim: 128
   titans_n_heads: 4  # Head dim = 8
 
   titans_cpu_offload: false  # Titans CPU Offload 選項
