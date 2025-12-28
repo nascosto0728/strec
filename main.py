@@ -7,6 +7,7 @@ import pandas as pd
 from tqdm import tqdm
 from typing import Dict, Any, List, Set, Optional
 import copy
+import gc
 
 import torch
 from torch.utils.data import DataLoader
@@ -42,8 +43,8 @@ class StreamingTrainer:
         self.cfg = config
         self.device = self._get_device()
         
-        # 1. 準備全量資料與 Meta Info
-        # df: 全量資料, meta: {'cate_matrix', ...}, maps: {'user_map', ...}
+        # 1. 準備全量資料與 Meta Info (這會觸發 utils 的 Cache 機制)
+        # full_df 已經包含了動態生成的 'period' 和序列 columns
         self.full_df, self.global_meta, self.id_maps = prepare_data_pipeline(self.cfg)
         
         # 將 Meta Info 注入 config 供 Model 使用
@@ -51,41 +52,13 @@ class StreamingTrainer:
         self.cfg['model']['n_items'] = self.global_meta['n_items']
         self.cfg['model']['n_cates'] = self.global_meta['n_cates']
         
-        # 2. 狀態追蹤器 (State Trackers)
-        # 用於負採樣：記錄每個用戶看過的所有物品 (跨 Period 累績)
+        # 2. 狀態追蹤器
         self.user_history_tracker: Dict[int, Set[int]] = {}
-        # 用於負採樣：記錄所有出現過的物品池
         self.seen_items_pool: Set[int] = set()
-        
-        # 3. 實驗結果容器
         self.results_log = []
 
-
-        print("--- [Self-Check] Verifying ID Shifts ---")
-        min_user = self.full_df['userId'].min()
-        min_item = self.full_df['itemId'].min()
-        max_item = self.full_df['itemId'].max()
-        n_items_conf = self.global_meta['n_items']
-
-        print(f"Min User ID: {min_user}")
-        print(f"Min Item ID: {min_item}")
-        print(f"Max Item ID: {max_item}")
-        print(f"Config n_items: {n_items_conf-1}")
-
-        # 驗證 1: 最小 ID 必須是 1 (不包含 0)
-        assert min_user >= 1, "Error: User ID contains 0!"
-        assert min_item >= 1, "Error: Item ID contains 0!"
-
-        # 驗證 2: Config 的大小必須包得住 Max ID
-        assert n_items_conf > max_item, f"Error: n_items ({n_items_conf}) <= max_item ({max_item})"
-
-        # 驗證 3: 檢查序列中是否有 0 (除了 padding 以外不該有)
-        # 這裡抽樣檢查一下
-        sample_seq = self.full_df['user_interacted_items'].iloc[0]
-        if len(sample_seq) > 0:
-            assert min(sample_seq) >= 1, "Error: Sequence contains 0!"
-
-        print("--- [Self-Check] Passed! IDs are correctly shifted. ---")
+        # 3. ID 檢查與資訊列印
+        self._run_sanity_check()
 
     def _get_device(self) -> torch.device:
         if torch.cuda.is_available():
@@ -94,6 +67,25 @@ class StreamingTrainer:
         else:
             print("--- Device: CPU ---")
             return torch.device("cpu")
+
+    def _run_sanity_check(self):
+        """檢查 ID 是否正確 Shift (最小值需 >= 1)"""
+        print(f"\n{'='*30} Data Sanity Check {'='*30}")
+        min_user = self.full_df['user_id'].min()
+        min_item = self.full_df['item_id'].min()
+        max_item = self.full_df['item_id'].max()
+        n_items_conf = self.global_meta['n_items']
+
+        print(f"Min User ID: {min_user} (Should be >= 1)")
+        print(f"Min Item ID: {min_item} (Should be >= 1)")
+        print(f"Max Item ID: {max_item}")
+        print(f"Config n_items: {n_items_conf-1}")
+        print(f"Total Periods Found: {self.full_df['period'].nunique()} (Max Period ID: {self.full_df['period'].max()})")
+
+        assert min_user >= 1, "Error: User ID contains 0 (Reserved for padding)!"
+        assert min_item >= 1, "Error: Item ID contains 0 (Reserved for padding)!"
+        assert n_items_conf > max_item, f"Error: n_items ({n_items_conf}) <= max_item ({max_item})"
+        print(f"{'='*80}\n")
 
     def _init_model(self):
         """根據 Config 初始化模型"""
@@ -156,7 +148,7 @@ class StreamingTrainer:
 
     def _get_dataloader(self, df: pd.DataFrame, shuffle: bool) -> DataLoader:
         """建立標準 DataLoader"""
-        dataset = RecommendationDataset(df, max_seq_len=30) # 硬編碼 30 或從 config 讀
+        dataset = RecommendationDataset(df, max_seq_len=self.cfg['model'].get('max_seq_len', 50)) 
         return DataLoader(
             dataset,
             batch_size=self.cfg['model']['batch_size'],
@@ -191,8 +183,17 @@ class StreamingTrainer:
         # optimizer = self.configure_optimizers(model, lr)
 
         # Period Loop
-        start_p = self.cfg['train_start_period']
-        end_p = self.cfg['num_periods']
+        start_p = self.cfg.get('train_start_period', 0)
+        
+        # 從資料中獲取實際的最大 Period ID
+        max_data_period = self.full_df['period'].max()
+        
+        # 如果 Config 有設 num_periods 且小於實際資料，則提早結束 (Debug 用)
+        # 否則就跑到資料結束
+        cfg_limit = self.cfg.get('num_periods', 9999)
+        end_p = min(cfg_limit, max_data_period + 1)
+        
+        print(f"--- Streaming Plan: Period {start_p} -> {end_p - 1} ---")
         
         for p_id in range(start_p, end_p-1):
             print(f"\n--- Period {p_id} Start ---")
@@ -203,17 +204,16 @@ class StreamingTrainer:
                 print(f"Period {p_id} is empty. Skipping.")
                 continue
 
-            # [新增] 提取當前 Period 的活躍 Item Pool
-            # 這是 Train Set 中出現過的所有 Item
-            self.active_items_list = curr_df['itemId'].unique()
+            # 更新活躍 Item Pool (用於 'active' 模式的負採樣/評估)
+            self.active_items_list = curr_df['item_id'].unique()
                 
             
             # 2. 繼承權重
             self._load_prev_period_weights(model, p_id, lr)
             
-            # 3. 準備 DataLoaders
-            # Train / Val Split
-            val_ratio = self.cfg.get('validation_split', 0.2)
+            # 3. Train / Val Split
+            # 這裡簡單依時間 (index) 切分，因為 full_df 已按時間排序
+            val_ratio = self.cfg.get('validation_split', 0.1)
             split_idx = int(len(curr_df) * (1 - val_ratio))
             train_df = curr_df.iloc[:split_idx]
             val_df = curr_df.iloc[split_idx:]
@@ -251,7 +251,11 @@ class StreamingTrainer:
                         test_loader = self._get_dataloader(test_df, shuffle=False)
                         metrics = self._evaluate(model, test_loader, next_p_id)
                         self.results_log.append(metrics)
-        
+
+        # 每個 Period 結束後清理記憶體
+            gc.collect()
+            torch.cuda.empty_cache()
+
         # End of Stream Summary
         self._print_summary(lr)
 
@@ -530,13 +534,13 @@ class StreamingTrainer:
     def _update_history_tracker(self, df: pd.DataFrame):
         """將當前 DataFrame 的互動紀錄加入全域 History"""
         # Group by user for efficiency
-        interactions = df.groupby('userId')['itemId'].apply(set).to_dict()
+        interactions = df.groupby('user_id')['item_id'].apply(set).to_dict()
         for u, items in interactions.items():
             if u not in self.user_history_tracker:
                 self.user_history_tracker[u] = set()
             self.user_history_tracker[u].update(items)
             
-        self.seen_items_pool.update(df['itemId'].unique())
+        self.seen_items_pool.update(df['item_id'].unique())
 
     def _print_summary(self, lr):
         """列印整場實驗的平均指標"""

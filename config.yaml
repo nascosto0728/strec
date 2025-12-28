@@ -1,40 +1,47 @@
-# Data paths
-data_path: './datasets/record_movielens.parquet'
-meta_path: './datasets/content_movielens.parquet'
+# config.yaml
 
-# Experiment settings
-dir_name: 'Meta_Refactored_Experiment'
-shuffle: false
-restored_ckpt_mode: 'last'
+dir_name: "exp_ml25m_titans"
+seed: 2024
+
+# 資料路徑 (指向 preprocess_data.py 的輸出)
+data_path: "./preprocess_data/ml25m_processed/inter_log.parquet"
+meta_path: "./preprocess_data/ml25m_processed/meta_data.pkl"
+
+# ★★★ 新增的資料處理參數 (utils.py 會讀取這些) ★★★
+data:
+  period_split_mode: "time"    # "time" or "quantile"
+  period_interval_hours: 168   # 7 days per period (僅在 mode=time 有效)
+  num_periods: 50              # 如果 mode=quantile，則切成 50 等份；如果 mode=time，這是 debug 用的最大執行期數
+  
+  history_mode: "count"        # "time" or "count"
+  history_window_hours: 720    # 30 days (僅在 mode=time 有效)
 
 # Training loop settings
-learning_rates: [0.001]
-num_periods: 14
-train_start_period: 0
+num_periods: 10
+train_start_period: 0         # 從第幾個 Period 開始訓練
 test_start_period: 8
-max_epochs: 10         # 每個 period 最多跑 100 個 epoch
 validation_split: 0.2   # 從「當前 period」切 20% 出來當驗證集
+learning_rates: [0.001]
+weight_decay: 0.0001
+max_epochs: 10         # 每個 period 最多跑 100 個 epoch
 patience: 1            # 驗證集損失 (val_loss) 連續 10 次沒進步就停止
 
-debug_sample: 0
-
+# Evaluation
 evaluation:
   sampling_size: 99
   Ks: [5, 10, 20, 50]
-
-item_vec_path: './vectors/item_vectors_kge.npy'
-cate_vec_path: './vectors/cate_vectors.npy'
+  sampling_mode: "seen" # active, seen, global
 
 # options: 'dual_tower_sasrec', 'dual_tower_titans'
 model_type: 'dual_tower_titans'  
-# Model Hyperparameters
+
 model:
   batch_size: 1024
-  text_embed_dim: 384
-  user_embed_dim: 128
   item_embed_dim: 128
-  output_dim: 128
-  cate_embed_dim: 128
+  max_seq_len: 50        # 序列最大長度 (重要)
+  
+  # Titans Specific
+  titans_n_heads: 4
   titans_n_heads: 4  # Head dim = 8
 
   titans_cpu_offload: false  # Titans CPU Offload 選項
