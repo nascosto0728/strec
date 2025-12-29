@@ -64,6 +64,10 @@ class StreamingTrainer:
         if torch.cuda.is_available():
             print("--- Device: CUDA ---")
             return torch.device("cuda")
+        # elif torch.backends.mps.is_available():
+        #     print("--- Device: MPS (Apple Silicon) ---")
+        #     torch.set_default_dtype(torch.float32)
+        #     return torch.device("mps")
         else:
             print("--- Device: CPU ---")
             return torch.device("cpu")
@@ -213,7 +217,7 @@ class StreamingTrainer:
             
             # 3. Train / Val Split
             # 這裡簡單依時間 (index) 切分，因為 full_df 已按時間排序
-            val_ratio = self.cfg.get('validation_split', 0.1)
+            val_ratio = self.cfg.get('validation_split', 0.2)
             split_idx = int(len(curr_df) * (1 - val_ratio))
             train_df = curr_df.iloc[:split_idx]
             val_df = curr_df.iloc[split_idx:]
@@ -577,7 +581,7 @@ if __name__ == "__main__":
         exit(1)
         
     # Set Seed
-    set_seed(config.get('seed', 2354))
+    set_seed(config.get('seed', 42))
     
     # Enforce Deterministic Behavior for Debugging (Optional)
     os.environ['TORCH_USE_CUDA_DSA'] = '1'

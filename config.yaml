@@ -9,15 +9,15 @@ meta_path: "./preprocess_data/ml25m_processed/meta_data.pkl"
 
 # ★★★ 新增的資料處理參數 (utils.py 會讀取這些) ★★★
 data:
-  period_split_mode: "time"    # "time" or "quantile"
+  period_split_mode: "quantile"    # "time" or "quantile"
   period_interval_hours: 168   # 7 days per period (僅在 mode=time 有效)
-  num_periods: 50              # 如果 mode=quantile，則切成 50 等份；如果 mode=time，這是 debug 用的最大執行期數
+  num_periods: 30              # 如果 mode=quantile，則切成 n 等份
   
   history_mode: "count"        # "time" or "count"
   history_window_hours: 720    # 30 days (僅在 mode=time 有效)
 
 # Training loop settings
-num_periods: 10
+num_periods: 10               # 這是 debug 用的最大執行期數
 train_start_period: 0         # 從第幾個 Period 開始訓練
 test_start_period: 8
 validation_split: 0.2   # 從「當前 period」切 20% 出來當驗證集
@@ -38,11 +38,10 @@ model_type: 'dual_tower_titans'
 model:
   batch_size: 1024
   item_embed_dim: 128
-  max_seq_len: 50        # 序列最大長度 (重要)
+  max_seq_len: 50        # 序列最大長度 
   
   # Titans Specific
   titans_n_heads: 4
-  titans_n_heads: 4  # Head dim = 8
 
   titans_cpu_offload: false  # Titans CPU Offload 選項
 

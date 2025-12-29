@@ -27,7 +27,7 @@ class UserMemoryBank:
         if not enable_cpu_offload and torch.cuda.is_available():
              location += f" (device={torch.cuda.current_device()})"
              
-        print(f"--- [MemoryBank] Allocating {n_users}x{state_shape} state on {location} ---")
+        print(f"--- [MemoryBank] Allocating {n_users}x{state_shape} state ---")
         print(f"--- [MemoryBank] Estimated Size: {mem_size_gb:.2f} GB ---")
         
         full_shape = (n_users,) + state_shape
@@ -129,15 +129,21 @@ class MultiHeadMetaGatedTitansLayer(nn.Module):
         # Flatten back to [B, D]
         return read_content.view(B, self.d_model)
 
-    def predict(self, user_static_emb, old_state):
-        """Step 1: Predict (Read Only)"""
-        x_norm = self.norm1(user_static_emb)
+    def predict(self, user_static_emb, old_state, last_item_emb):
+        # 1. 使用 "Last Item" 作為 Query 來激活記憶 (Associative Recall)
+        #    這代表： "Based on what I just saw, what do I remember?"
+        #    如果 last_item_emb 是 BOS (冷啟動)，則代表 "Based on nothing/start, what do I remember?"
+        q_norm = self.norm1(last_item_emb) 
+        read_content = self._read_memory(q_norm, old_state)
         
-        # Retrieval
-        read_content = self._read_memory(x_norm, old_state)
+        # 2. 融合 User Static (人設) + Memory Output (聯想結果)
+        #    這裡把 User Static 加回來，作為 Residual 或 Base
+        #    這樣模型既知道 "我是誰" (Static)，也知道 "我剛看了什麼引發的聯想" (Memory)
         
-        # Fusion & FFN
+        # Fusion: Linear Projection
         attn_output = self.proj_out(read_content)
+        
+        # Residual Connection
         x = user_static_emb + self.dropout1(attn_output)
         
         x2 = self.norm2(x)
@@ -151,11 +157,15 @@ class MultiHeadMetaGatedTitansLayer(nn.Module):
         B, D = item_emb.shape
         H, Dh = self.n_heads, self.head_dim
         
-        # 1. Meta-Context: 結合 User 本質與當下記憶
-        x_static_norm = self.norm1(user_static_emb)
-        memory_context = self._read_memory(x_static_norm, old_state)
-        meta_input = torch.cat([x_static_norm, memory_context], dim=-1) # [B, 2D]
+        # 1. Meta-Context Preparation
+        # 使用 Current Item 作為 Query 去讀記憶
+        i_norm = self.norm1(item_emb)
+        memory_context = self._read_memory(i_norm, old_state) # [B, D]
         
+        # Meta Input: User Static (Who) + Context (Memory match)
+        user_static_norm = self.norm1(user_static_emb)
+        meta_input = torch.cat([user_static_norm,  memory_context], dim=-1) # [B, 2D]
+
         # 2. Meta-Controller 生成參數
         meta_out = self.meta_controller(meta_input)
         
@@ -446,7 +456,11 @@ class DualTowerTitans(nn.Module):
         )
         
         # D. Predict
-        titans_out = self.user_titans.predict(user_static, current_state)
+        titans_out = self.user_titans.predict(
+            user_static_emb=user_static, 
+            old_state=current_state,
+            last_item_emb=update_input_emb 
+        )
         user_features = torch.cat([user_static, titans_out], dim=-1)
 
         # [State Update] Only during training
