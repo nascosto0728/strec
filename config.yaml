@@ -2,8 +2,8 @@
 
 seed: 42
 
-data_path: "./preprocess_data/foursquare_processed/inter_log.parquet" # 原始資料路徑 (User, Item, Timestamp, Label)
-meta_path: "./preprocess_data/foursquare_processed/meta_data.pkl"     # 靜態 Meta (ID Map, Category Map)
+data_path: "./preprocess_data/ml25m_processed/inter_log.parquet" # 原始資料路徑 (User, Item, Timestamp, Label)
+meta_path: "./preprocess_data/ml25m_processed/meta_data.pkl"     # 靜態 Meta (ID Map, Category Map)
 
 experiment:
   num_periods: 999             # 最大執行期數 (設小一點可以快速跑完流程 debug)

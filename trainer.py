@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
+import copy
 from collections import defaultdict
 import logging
 from tqdm import tqdm  # [New] Import tqdm
@@ -197,6 +198,9 @@ class StreamingTrainer:
         patience = 1
         best_val_loss = float('inf')
         patience_counter = 0
+
+        best_model_state = None
+        best_item_cache_state = None
         
         for epoch in range(max_epochs):
             # 1. 重置 Memory (確保權重學習不受 Memory 漂移影響)
@@ -216,15 +220,21 @@ class StreamingTrainer:
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 patience_counter = 0
-                # 這裡可以選擇保存 weights，但簡單起見我們假設最後狀態就是不錯的
+
+                # [Save Best State]
+                # 深拷貝權重 (包含 Embedding, Towers)
+                best_model_state = copy.deepcopy(self.model.state_dict())
+                best_item_cache_state = self.model.item_cache.clone().detach()
             else:
                 patience_counter += 1
                 if patience_counter >= patience:
                     self.logger.info("   >> Early stopping triggered.")
                     break
         
-        # --- Stage 1: Final Commit (Memory Update) ---
-        self.logger.info(f"--- Period {period_id}: Final Memory Commit ---")
+        # Load Best Model State
+        if best_model_state is not None:
+            self.model.load_state_dict(best_model_state)
+            # 注意：load_state_dict 會覆蓋 item_cache (如果它是 buffer)
         
         
         # 跑 Val Set (20%) - Update Memory & Cache
@@ -243,11 +253,6 @@ class StreamingTrainer:
         
         use_legacy_model = False  # <--- [實驗變數] True: 跑舊模型, False: 跑新模型
         if not use_legacy_model:
-            # --- Transition ---
-            snapshot = None
-            if period_id > 0 and loader_seq is not None:
-                self.logger.info("Creating Memory Snapshot for Stage 2...")
-                snapshot = self.model.memory_bank.create_snapshot()
             
             # --- Stage 2 ---
             if period_id > 0 and loader_seq is not None:
@@ -255,10 +260,10 @@ class StreamingTrainer:
                 self.model.toggle_stage(2)
                 self._init_optimizer(stage=2)
                 
-                metrics_s2 = self.train_seq_epoch(loader_seq, snapshot, period_id)
+                metrics_s2 = self.train_seq_epoch(loader_seq, snapshot_start, period_id)
                 self.logger.info(f"Period {period_id} Stage 2 Done. Loss: {metrics_s2['loss']:.4f}")
                 
-                del snapshot
+                del snapshot_start
             else:
                 self.logger.info(f"Skipping Stage 2 for Period {period_id}")
 
