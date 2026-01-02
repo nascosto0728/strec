@@ -2,19 +2,19 @@
 
 seed: 42
 
-data_path: "./preprocess_data/ml25m_processed/inter_log.parquet" # 原始資料路徑 (User, Item, Timestamp, Label)
-meta_path: "./preprocess_data/ml25m_processed/meta_data.pkl"     # 靜態 Meta (ID Map, Category Map)
+data_path: "./preprocess_data/foursquare_processed/inter_log.parquet" # 原始資料路徑 (User, Item, Timestamp, Label)
+meta_path: "./preprocess_data/foursquare_processed/meta_data.pkl"     # 靜態 Meta (ID Map, Category Map)
 
 experiment:
-  num_periods: 13             # 最大執行期數 (設小一點可以快速跑完流程 debug)
+  num_periods: 999             # 最大執行期數 (設小一點可以快速跑完流程 debug)
   train_start_period: 0       # 從第幾個 Period 開始正式訓練 (Stage 2)
-  test_start_period: 2        # 從第幾個 Period 開始評估 (忽略早期的不穩定結果)
+  test_start_period: 5        # 從第幾個 Period 開始評估 (忽略早期的不穩定結果)
 
 data:
-  period_split_mode: "quantile"       # 'time' or 'quantile'
+  period_split_mode: "time"       # 'time' or 'quantile'
   num_periods: 30                     # 若用 quantile，切分成幾份
   period_interval_hours: 168          # 若用 time，幾小時一份
-  history_mode: "count"               # 'time' or 'count'
+  history_mode: "time"               # 'time' or 'count'
   history_window_hours: 720           # 若用 time，看多久以前的歷史
   
 model:
@@ -24,14 +24,13 @@ model:
   context_len: 20                     # K (Stage 2 Context Length / Stage 1 Window)
   dropout: 0.1
   temperature: 0.07
-  titans_cpu_offload: true            # 是否將 Memory Bank 放在 CPU (省顯存)
+  titans_cpu_offload: false            # 是否將 Memory Bank 放在 CPU (省顯存)
 
 train:
   lr_stage1: 0.001
   lr_stage2: 0.001
   batch_size_stage1: 1024              # Step Mode Batch Size
-  batch_size_stage2: 64               # Seq Mode Batch Size
-  epochs_per_period: 1                # Streaming 通常只跑 1 epoch
+  batch_size_stage2: 256               # Seq Mode Batch Size
   weight_decay: 1e-5
 
 evaluation:

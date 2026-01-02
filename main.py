@@ -86,7 +86,23 @@ def main():
     cfg['model']['n_cates'] = global_meta['n_cates']
     
     # 5. Model & Trainer Init
-    model = DualTowerTitans(global_meta, cfg).to(device)
+    # model = DualTowerTitans(global_meta, cfg).to(device)
+
+    # 5. Model & Trainer Init
+    use_legacy_model = False  # <--- [實驗變數] True: 跑舊模型, False: 跑新模型
+
+    if use_legacy_model:
+        print("\n=== [Experiment] Switching to LEGACY Titans Model ===")
+        # 引入舊模型 Class (假設在 model_tmp.py)
+        from model_tmp import DualTowerTitans as LegacyClass 
+        from model_legacy_adapter import LegacyTitansAdapter
+        # Adapter 會負責處理 Config 的相容性
+        model = LegacyTitansAdapter(global_meta, cfg, LegacyClass).to(device)
+    else:
+        print("\n=== [Experiment] Using NEW DualTowerTitans Model ===")
+        # 引入新模型
+        from model import DualTowerTitans # 假設新模型檔名
+        model = DualTowerTitans(global_meta, cfg).to(device)
 
     # === [DEBUG Tool] Register NaN Hooks ===
     def check_nan_hook(module, input, output):
@@ -151,21 +167,23 @@ def main():
         # 否則 Memory 會是空的。
         print(f"[Data] Step Loader: {len(curr_df)} interactions")
         
-        ds_step = RecommendationDataset(
-            curr_df, 
-            mode='step', 
-            max_seq_len=cfg['model']['max_seq_len'] # 這裡用作 context window padding
-        )
+        split_idx = int(len(curr_df) * 0.8)
+        train_df = curr_df.iloc[:split_idx]
+        val_check_df = curr_df.iloc[split_idx:]
         
-        unique_sampler = UniqueUserBatchSampler(
-            ds_step.user_ids, 
-            batch_size=cfg['train']['batch_size_stage1']
-        )
+        # 1. Train Loader (用於反覆訓練權重)
+        ds_train = RecommendationDataset(train_df, mode='step', max_seq_len=cfg['model']['max_seq_len'])
+        sampler_train = UniqueUserBatchSampler(ds_train.user_ids, batch_size=cfg['train']['batch_size_stage1'])
+        loader_train = DataLoader(ds_train, batch_sampler=sampler_train, num_workers=0)
         
-        loader_step = DataLoader(
-            ds_step,
-            batch_sampler=unique_sampler, 
-            num_workers=0
+        # 2. Val Check Loader (用於檢查收斂，不更新權重)
+        # 這裡可以用一般的 DataLoader，不需要 UniqueUserSampler
+        ds_val_check = RecommendationDataset(val_check_df, mode='step', max_seq_len=cfg['model']['max_seq_len'])
+        loader_val_check = DataLoader(
+            ds_val_check, 
+            batch_size=cfg['train']['batch_size_stage1'], 
+            shuffle=False, 
+            drop_last=False
         )
 
         # -------------------------------------------------
@@ -222,7 +240,8 @@ def main():
         # run_period 內部會根據 loader 是否為 None 自動跳過相應階段
         period_metrics = trainer.run_period(
             p_id, 
-            loader_step, 
+            loader_train,      # 80% 資料
+            loader_val_check,  # 20% 資料 (用於 Early Stopping)
             loader_seq, 
             loader_eval
         )

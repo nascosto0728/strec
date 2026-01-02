@@ -36,7 +36,7 @@ class StreamingTrainer:
         self.k_list = cfg['evaluation'].get('Ks', [10, 20])
         
         # Gradient Clipping Threshold
-        self.max_grad_norm = cfg['train'].get('max_grad_norm', 5.0)
+        self.max_grad_norm = cfg['train'].get('max_grad_norm', 100.0)
         
         self.optimizer = None
 
@@ -159,7 +159,7 @@ class StreamingTrainer:
                 outputs = self.model.forward_stage1(
                     batch, 
                     training=update_memory,
-                    update_cache=False,
+                    update_cache=True,
                     compute_metrics=True,
                     k_list=self.k_list
                 )
@@ -181,7 +181,7 @@ class StreamingTrainer:
             
         return {k: v.avg for k, v in meters.items()}
 
-    def run_period(self, period_id, loader_step, loader_seq, loader_eval):
+    def run_period(self, period_id, loader_train, loader_val_check, loader_seq, loader_eval):
         """Orchestrate one full period"""
         self.logger.info(f"\n{'='*40}\nStarting Period {period_id}\n{'='*40}")
         
@@ -189,31 +189,78 @@ class StreamingTrainer:
         self.logger.info(f"--- Period {period_id}: Stage 1 (Greedy Step) ---")
         self.model.toggle_stage(1)
         self._init_optimizer(stage=1)
+
+        snapshot_start = self.model.memory_bank.create_snapshot()
         
-        metrics_s1 = self.train_step_epoch(loader_step, period_id)
+        # 設定 Early Stopping 參數
+        max_epochs = 10
+        patience = 1
+        best_val_loss = float('inf')
+        patience_counter = 0
+        
+        for epoch in range(max_epochs):
+            # 1. 重置 Memory (確保權重學習不受 Memory 漂移影響)
+            self.model.memory_bank.restore_snapshot(snapshot_start)
+            
+            # 2. Train on 80% (Update Weights, Temporary Memory)
+            # 這裡 update_cache=False, 只有最後一次才更新 Item Cache
+            self.train_step_epoch(loader_train, period_id)
+            
+            # 3. Check Convergence on 20%
+            val_metrics = self.evaluate(loader_val_check, update_memory=False)
+            val_loss = val_metrics['loss']
+            
+            self.logger.info(f"   [Ep {epoch}] Val Loss: {val_loss:.4f}")
+            
+            # Early Stopping Logic
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                patience_counter = 0
+                # 這裡可以選擇保存 weights，但簡單起見我們假設最後狀態就是不錯的
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    self.logger.info("   >> Early stopping triggered.")
+                    break
+        
+        # --- Stage 1: Final Commit (Memory Update) ---
+        self.logger.info(f"--- Period {period_id}: Final Memory Commit ---")
+        
+        
+        # 跑 Val Set (20%) - Update Memory & Cache
+        # 這是之前沒訓練過的部分，現在補上記憶
+        # 這裡必須使用 train_step_epoch 因為我們要 update memory
+        # 注意：這時 loader_val_check 會被視為 training data
+        self.train_step_epoch(loader_val_check, period_id)
+        
+        # 到此，Memory 包含了 100% 的 Period T 資訊，且模型權重已收斂
+        
+        metrics_s1 = {'loss': best_val_loss} # 紀錄最好的 loss
         
         log_str = f"Loss: {metrics_s1['loss']:.4f}"
         if 'auc' in metrics_s1: log_str += f" | AUC: {metrics_s1['auc']:.4f}"
         self.logger.info(f"Period {period_id} Stage 1 Done. {log_str}")
         
-        # --- Transition ---
-        snapshot = None
-        if period_id > 0 and loader_seq is not None:
-            self.logger.info("Creating Memory Snapshot for Stage 2...")
-            snapshot = self.model.memory_bank.create_snapshot()
-        
-        # --- Stage 2 ---
-        if period_id > 0 and loader_seq is not None:
-            self.logger.info(f"--- Period {period_id}: Stage 2 (Seq Memory) ---")
-            self.model.toggle_stage(2)
-            self._init_optimizer(stage=2)
+        use_legacy_model = False  # <--- [實驗變數] True: 跑舊模型, False: 跑新模型
+        if not use_legacy_model:
+            # --- Transition ---
+            snapshot = None
+            if period_id > 0 and loader_seq is not None:
+                self.logger.info("Creating Memory Snapshot for Stage 2...")
+                snapshot = self.model.memory_bank.create_snapshot()
             
-            metrics_s2 = self.train_seq_epoch(loader_seq, snapshot, period_id)
-            self.logger.info(f"Period {period_id} Stage 2 Done. Loss: {metrics_s2['loss']:.4f}")
-            
-            del snapshot
-        else:
-            self.logger.info(f"Skipping Stage 2 for Period {period_id}")
+            # --- Stage 2 ---
+            if period_id > 0 and loader_seq is not None:
+                self.logger.info(f"--- Period {period_id}: Stage 2 (Seq Memory) ---")
+                self.model.toggle_stage(2)
+                self._init_optimizer(stage=2)
+                
+                metrics_s2 = self.train_seq_epoch(loader_seq, snapshot, period_id)
+                self.logger.info(f"Period {period_id} Stage 2 Done. Loss: {metrics_s2['loss']:.4f}")
+                
+                del snapshot
+            else:
+                self.logger.info(f"Skipping Stage 2 for Period {period_id}")
 
         # --- Evaluation ---
         metrics_eval = {}

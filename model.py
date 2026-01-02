@@ -142,11 +142,17 @@ class UserMemoryBank(nn.Module):
         self.states.index_copy_(0, ids_target, states_target)
         self.momentums.index_copy_(0, ids_target, moments_target)
         
-    def reset(self):
-        """重置所有記憶 (用於 Stage 切換或新實驗)"""
-        self.states.zero_()
-        self.momentums.zero_()
-        print("--- [UserMemoryBank] All states reset to zero. ---")
+    def restore_snapshot(self, snapshot: Tuple[torch.Tensor, torch.Tensor]):
+        """
+        從 Snapshot 還原整個 Bank 的狀態。
+        用於 Intra-Period Training 的每個 Epoch 重置。
+        """
+        s_snap, m_snap = snapshot
+        
+        # 確保 snapshot 在 CPU (通常 create_snapshot 已經放 CPU 了)
+        # 使用 copy_ 將數據寫回 self.states (無論它在 CPU 還是 GPU)
+        self.states.copy_(s_snap)
+        self.momentums.copy_(m_snap)
 
     def save_bank(self, dir_path: str, name: str = "memory_bank.pt"):
         """

@@ -210,52 +210,52 @@ class MultiHeadMetaGatedTitansLayer(nn.Module):
 # ===================================================================
 #  Core Component 3: CMS Projection Head (For User Tower)
 # ===================================================================
-# class CMS_ProjectionHead(nn.Module):
-#     """
-#     Continuum Memory System (Gated)
-#     包含 Fast Lane (短期適應) 與 Slow Lane (長期記憶)。
-#     """
-#     def __init__(self, input_dim, hidden_dim, dropout=0.1):
-#         super().__init__()
+class CMS_ProjectionHead(nn.Module):
+    """
+    Continuum Memory System (Gated)
+    包含 Fast Lane (短期適應) 與 Slow Lane (長期記憶)。
+    """
+    def __init__(self, input_dim, hidden_dim, dropout=0.1):
+        super().__init__()
         
-#         # [Fast Lane] 淺層、快速適應
-#         self.fast_net = nn.Sequential(
-#             nn.Linear(input_dim, hidden_dim // 2),
-#             nn.LayerNorm(hidden_dim // 2),
-#             nn.ReLU(),
-#             nn.Dropout(dropout),
-#             nn.Linear(hidden_dim // 2, input_dim)
-#         )
+        # [Fast Lane] 淺層、快速適應
+        self.fast_net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, input_dim)
+        )
         
-#         # [Slow Lane] 深層、長期記憶 (需配合 Optimizer 低 LR)
-#         self.slow_net = nn.Sequential(
-#             nn.Linear(input_dim, hidden_dim),
-#             nn.LayerNorm(hidden_dim),
-#             nn.ReLU(),
-#             nn.Dropout(dropout),
-#             nn.Linear(hidden_dim, hidden_dim), 
-#             nn.ReLU(),
-#             nn.Linear(hidden_dim, input_dim)
-#         )
+        # [Slow Lane] 深層、長期記憶 (需配合 Optimizer 低 LR)
+        self.slow_net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim), 
+            nn.ReLU(),
+            nn.Linear(hidden_dim, input_dim)
+        )
 
-#         # Gating 機制：決定依賴短期還是長期
-#         self.gate = nn.Sequential(
-#             nn.Linear(input_dim, 32),
-#             nn.ReLU(),
-#             nn.Linear(32, 1),
-#             nn.Sigmoid()
-#         )
+        # Gating 機制：決定依賴短期還是長期
+        self.gate = nn.Sequential(
+            nn.Linear(input_dim, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+            nn.Sigmoid()
+        )
         
-#         self.out_norm = nn.LayerNorm(input_dim)
+        self.out_norm = nn.LayerNorm(input_dim)
 
-#     def forward(self, x):
-#         fast_out = self.fast_net(x)
-#         slow_out = self.slow_net(x)
+    def forward(self, x):
+        fast_out = self.fast_net(x)
+        slow_out = self.slow_net(x)
         
-#         alpha = self.gate(x)
-#         fused = alpha * fast_out + (1 - alpha) * slow_out
+        alpha = self.gate(x)
+        fused = alpha * fast_out + (1 - alpha) * slow_out
         
-#         return self.out_norm(x + fused)
+        return self.out_norm(x + fused)
 
 # ===================================================================
 #  Core Component 4: Standard Transformer (For Item Tower)
@@ -397,30 +397,11 @@ class DualTowerTitans(nn.Module):
         ])
 
     def _create_mlp(self, input_dim):
-        expansion_factor = 2
-        inner_dim = int(input_dim * expansion_factor)
-        dropout = 0.0 
-        
-        # PreNorm Residual MLP Block
-        class PreNormResidualBlock(nn.Module):
-            def __init__(self, dim, fn):
-                super().__init__()
-                self.fn = fn
-                self.norm = nn.LayerNorm(dim)
-            def forward(self, x):
-                return self.fn(self.norm(x)) + x          
-        def _block():
-            return nn.Sequential(
-                nn.Linear(input_dim, inner_dim),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-                nn.Linear(inner_dim, input_dim),
-                nn.Dropout(dropout)
+        return CMS_ProjectionHead(
+            input_dim=input_dim,
+            hidden_dim=input_dim * 2, 
+            dropout=0.1
             )
-            
-        return nn.Sequential(
-            PreNormResidualBlock(input_dim, _block())
-        )
             
 
     def _init_weights(self):
@@ -514,7 +495,13 @@ class DualTowerTitans(nn.Module):
         
         # Update Negatives Buffer
         if self.training:
-            self.user_history_buffer.weight[batch['item_id']] = item_history_emb.detach()
+            # 使用 torch.no_grad() 並配合 copy_ 進行安全更新
+            with torch.no_grad():
+                self.user_history_buffer.weight.index_copy_(
+                    0, 
+                    batch['item_id'], 
+                    item_history_emb.detach()
+                )
             
         item_features = torch.cat([item_composite_static, item_history_emb], dim=-1)
 
